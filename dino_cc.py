@@ -5,69 +5,94 @@ from transformers import AutoImageProcessor, AutoModel
 from PIL import Image
 import requests
 import numpy as np
+from abc import ABC, abstractmethod
+from typing import NamedTuple, Tuple
 
 from vec import IVec2
 
 
-class SimCCPoseHead(nn.Module):
-    def __init__(self, in_channels:int, num_joints:int, grid_size:IVec2,
-                 out_size:IVec2, split_ratio:float):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_size = out_size
-        self.grid_size = grid_size
-        self.num_joints = num_joints
-        self.split_ratio = split_ratio
-        
-        # Continuous sub-pixel coordinate bins
-        self.out_bins_size = IVec2(int(out_size.x * split_ratio), int(out_size.y * split_ratio))
-        
-        # Neck: Adapt transformer features and capture local neighborhood context
-        self.neck = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=1, bias=False),
-            nn.GroupNorm(32, 256),
-            nn.GELU(),
-            # Depthwise convolution: stabilizes ambiguous loose/dark fabrics
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, groups=256, bias=False),
-            nn.Conv2d(256, 256, kernel_size=1, bias=False),
-            nn.GroupNorm(32, 256),
-            nn.GELU()
-        )
+class BaseSimCCHead(nn.Module, ABC):
+  """Formal interface for any SimCC head variant."""
 
-        # X-Branch: Pool along height -> project to horizontal bins
-        self.mlp_x = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, None)),
-            nn.Flatten(start_dim=2),
-            nn.Linear(self.grid_size.x, self.out_bins_size.x)
-        )
-        self.fc_x = nn.Linear(256, num_joints)
+  @abstractmethod
+  def forward(
+      self, patch_tokens: torch.Tensor
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Args:
 
-        # Y-Branch: Pool along width -> project to vertical bins
-        self.mlp_y = nn.Sequential(
-            nn.AdaptiveAvgPool2d((None, 1)),
-            nn.Flatten(start_dim=2),
-            nn.Linear(self.grid_size.y, self.out_bins_size.y)
-        )
+        patch_tokens: [B, N, C]
 
-        self.fc_y = nn.Linear(256, num_joints)
+    Returns:
+        (pred_x, pred_y): ([B, K, W_bins], [B, K, H_bins])
+    """
+    pass
 
-    def forward(self, patch_tokens):
-        # patch_tokens: [B, 768, 768] (without CLS token)
-        B, N, C = patch_tokens.shape
-        
-        # Reshape to spatial feature map: [B, C, grid_y, grid_x]
-        x_2d = patch_tokens.permute(0, 2, 1).reshape(B, C, self.grid_size.y, self.grid_size.x)
-        feat = self.neck(x_2d) # [B, 256, grid_y, grid_x]
 
-        # Classify X coordinate
-        feat_x = self.mlp_x(feat).permute(0, 2, 1)  # [B, out_w_bins, 256]
-        pred_x = self.fc_x(feat_x).permute(0, 2, 1) # [B, num_joints, out_w_bins]
+class DepthwiseSimCCHead(BaseSimCCHead):
+  """Your current head with 1x1 + 3x3 depthwise + 1x1 neck."""
 
-        # Classify Y coordinate
-        feat_y = self.mlp_y(feat).permute(0, 2, 1)  # [B, out_h_bins, 256]
-        pred_y = self.fc_y(feat_y).permute(0, 2, 1) # [B, num_joints, out_h_bins]
+  def __init__(
+      self,
+      in_channels: int,
+      num_joints: int,
+      grid_size: IVec2,
+      out_size: IVec2,
+      split_ratio: float = 2.0,
+      neck_dim: int = 256,
+  ):
+    super().__init__()
+    self.grid_size = grid_size
+    self.neck_dim = neck_dim
+    self.out_bins_size = IVec2(
+        int(out_size.x * split_ratio), int(out_size.y * split_ratio)
+    )
 
-        return pred_x, pred_y
+    self.neck = nn.Sequential(
+        nn.Conv2d(in_channels, neck_dim, kernel_size=1, bias=False),
+        nn.GroupNorm(32, neck_dim),
+        nn.GELU(),
+        nn.Conv2d(
+            neck_dim,
+            neck_dim,
+            kernel_size=3,
+            padding=1,
+            groups=neck_dim,
+            bias=False,
+        ),
+        nn.Conv2d(neck_dim, neck_dim, kernel_size=1, bias=False),
+        nn.GroupNorm(32, neck_dim),
+        nn.GELU(),
+    )
+
+    self.mlp_x = nn.Sequential(
+        nn.AdaptiveAvgPool2d((1, None)),
+        nn.Flatten(start_dim=2),
+        nn.Linear(self.grid_size.x, self.out_bins_size.x),
+    )
+    self.fc_x = nn.Linear(neck_dim, num_joints)
+
+    self.mlp_y = nn.Sequential(
+        nn.AdaptiveAvgPool2d((None, 1)),
+        nn.Flatten(start_dim=2),
+        nn.Linear(self.grid_size.y, self.out_bins_size.y),
+    )
+    self.fc_y = nn.Linear(neck_dim, num_joints)
+
+  def forward(self, patch_tokens: torch.Tensor):
+    B, _, C = patch_tokens.shape
+    x_2d = patch_tokens.permute(0, 2, 1).reshape(
+        B, C, self.grid_size.y, self.grid_size.x
+    )
+    feat = self.neck(x_2d)
+
+    # Note: transpose(1, 2) is cleaner than permute(0, 2, 1)
+    feat_x = self.mlp_x(feat).transpose(1, 2)
+    pred_x = self.fc_x(feat_x).transpose(1, 2)
+
+    feat_y = self.mlp_y(feat).transpose(1, 2)
+    pred_y = self.fc_y(feat_y).transpose(1, 2)
+
+    return pred_x, pred_y
 
 
 class DinoCC(nn.Module):
@@ -87,13 +112,20 @@ class DinoCC(nn.Module):
                 param.requires_grad = False
 
         # Create custom head
-        self.head = SimCCPoseHead(
+        self.head = DepthwiseSimCCHead(
             in_channels=self.backbone.config.hidden_size,
             num_joints=self.num_joints,
             grid_size=self.grid_size,
             out_size=IVec2(self.img_size.x, self.img_size.y),
-            split_ratio=2.0
+            split_ratio=2.0,
+            neck_dim=256
         )
+
+    def load_weights(self, checkpoint_path, map_location='cpu', strict=True):
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        self.load_state_dict(state_dict, strict=strict)
+        return checkpoint
 
 
     def forward(self, pixel_values):
