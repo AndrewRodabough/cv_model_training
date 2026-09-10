@@ -1,0 +1,4 @@
+--data-set-version = 1.0.0
+--tasks = 4
+--total-frames = 219
+--test-train-split = 0.8

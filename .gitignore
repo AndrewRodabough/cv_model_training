@@ -1,5 +1,8 @@
 /weights
 /.vscode
-/datasets
+/dataset
 /__pycache__
 /test
+/temp
+*.pt
+*.safetensors
