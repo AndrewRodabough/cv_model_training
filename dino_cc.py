@@ -8,7 +8,12 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import NamedTuple, Tuple
 
-from vec import IVec2
+try:
+    from vec import IVec2
+except ModuleNotFoundError:
+    class IVec2(NamedTuple):
+        x: int
+        y: int
 
 
 class BaseSimCCHead(nn.Module, ABC):
@@ -96,7 +101,8 @@ class DepthwiseSimCCHead(BaseSimCCHead):
 
 
 class DinoCC(nn.Module):
-    def __init__(self, num_joints:int, img_size:IVec2, freeze_backbone: bool = True):
+    def __init__(self, num_joints: int, img_size: IVec2, freeze_backbone: bool = True,
+                 split_ratio: float = 2.0, neck_dim: int = 256):
         super().__init__()
         self.patch_size = 14
         self.num_joints = num_joints
@@ -117,8 +123,8 @@ class DinoCC(nn.Module):
             num_joints=self.num_joints,
             grid_size=self.grid_size,
             out_size=IVec2(self.img_size.x, self.img_size.y),
-            split_ratio=2.0,
-            neck_dim=256
+            split_ratio=split_ratio,
+            neck_dim=neck_dim
         )
 
     def load_weights(self, checkpoint_path, map_location='cpu', strict=True):

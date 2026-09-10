@@ -1,15 +1,25 @@
 import argparse
 import random
+import shutil
+from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import yaml
 from PIL import Image, ImageEnhance, ImageOps
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
-from vec import IVec2
+try:
+    from vec import IVec2
+except ModuleNotFoundError:
+    from typing import NamedTuple
+
+    class IVec2(NamedTuple):
+        x: int
+        y: int
 
 
 IMAGE_SIZE = IVec2(336, 448)
@@ -17,6 +27,8 @@ KEYPOINT_IDS = list(range(6, 12)) + list(range(15, 29))
 KEYPOINT_INDEX = {point_id: index for index, point_id in enumerate(KEYPOINT_IDS)}
 NUM_JOINTS = len(KEYPOINT_IDS)
 BBOX_PADDING = 0.05
+SIMCC_SPLIT_RATIO = 2.0
+SIMCC_SIGMA = 6.0
 LEFT_RIGHT_PAIRS = (
     (6, 9),
     (7, 10),
@@ -72,10 +84,11 @@ def parse_person(person):
         joint_id = KEYPOINT_INDEX[point_id]
         x, y = (float(value) for value in point.get('x').split(',')) if ',' in point.get('x', '') else (float(point.get('x')), float(point.get('y')))
         keypoints[joint_id] = [x, y, float(point.get('visibility', '0'))]
-    bbox = tuple(
-        float(person.get(name))
-        for name in ('bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2')
-    )
+    bbox_element = person.find('bbox')
+    if bbox_element is not None:
+        bbox = tuple(float(bbox_element.get(name)) for name in ('x1', 'y1', 'x2', 'y2'))
+    else:
+        bbox = tuple(float(person.get(name)) for name in ('bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2'))
     return keypoints, bbox
 
 
@@ -169,7 +182,7 @@ def make_loader(dataset, batch_size, workers):
 
 def make_targets(keypoints, device):
     targets = [
-        generate_simcc_labels(sample.numpy(), IMAGE_SIZE)
+        generate_simcc_labels(sample.numpy(), IMAGE_SIZE, split_ratio=SIMCC_SPLIT_RATIO, sigma=SIMCC_SIGMA)
         for sample in keypoints
     ]
     target_x, target_y, weights = zip(*targets)
@@ -184,7 +197,7 @@ def make_targets(keypoints, device):
     )
 
 
-def run_epoch(model, loader, criterion, optimizer, device, scaler, training):
+def run_epoch(model, loader, criterion, optimizer, device, scaler, training, gradient_clip_norm):
     model.train(training)
     total_loss = 0.0
 
@@ -202,7 +215,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, training):
         if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -213,20 +226,44 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, training):
 
 def main():
     parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
-    parser.add_argument('--annotations', default='datasets/cleaned_dataset_1.0_9-9/annotations/annotations.xml')
-    parser.add_argument('--output', default='weights/dino_cc_cleaned.pt')
-    parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--batch-size', type=int, default=4)
-    parser.add_argument('--learning-rate', type=float, default=1e-3)
-    parser.add_argument('--weight-decay', type=float, default=1e-4)
-    parser.add_argument('--augmentation-repeats', type=int, default=4)
+    parser.add_argument('--config', default='config.yaml')
     parser.add_argument('--workers', type=int, default=2)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--patience', type=int, default=6)
     args = parser.parse_args()
 
-    set_seed(args.seed)
-    annotation_file = Path(args.annotations)
+    config_path = Path(args.config).resolve()
+    with open(config_path, encoding='utf-8') as config_file:
+        config = yaml.safe_load(config_file)
+
+    runs_dir = Path('training/runs')
+    run_date = datetime.now().strftime('%Y_%m_%d')
+    run_number = 1
+    while (runs_dir / f'{run_date}_{run_number:03d}').exists():
+        run_number += 1
+    run_dir = runs_dir / f'{run_date}_{run_number:03d}'
+    run_dir.mkdir(parents=True, exist_ok=False)
+    run_config_path = run_dir / 'config.yaml'
+    shutil.copy2(config_path, run_config_path)
+
+    image_config = config['image_input']
+    training_config = config['training']
+    head_config = config['head']
+    backbone_config = config['backbone']
+    global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
+    IMAGE_SIZE = IVec2(image_config['width'], image_config['height'])
+    KEYPOINT_IDS = list(head_config['keypoint_ids'])
+    KEYPOINT_INDEX = {point_id: index for index, point_id in enumerate(KEYPOINT_IDS)}
+    NUM_JOINTS = len(KEYPOINT_IDS)
+    BBOX_PADDING = image_config['bbox_padding']
+    SIMCC_SPLIT_RATIO = head_config['simcc']['split_ratio']
+    SIMCC_SIGMA = head_config['simcc']['gaussian_sigma']
+    if head_config['type'] != 'simcc' or head_config['name'] != 'depthwise_simcc':
+        raise ValueError('This trainer supports only the depthwise_simcc head.')
+    if backbone_config['name'] != 'dino_v2_base':
+        raise ValueError('This trainer supports only dino_v2_base.')
+
+    annotations_path = Path(config['annotations'])
+    set_seed(config.get('seed', 42))
+    annotation_file = annotations_path
     root = ET.parse(annotation_file).getroot()
     task_ids = [video.get('id') for video in root.findall('./project/videos/video')]
     full_dataset = KeypointDataset(annotation_file, set(task_ids))
@@ -235,7 +272,7 @@ def main():
         image_groups.setdefault(image_path, []).append(index)
     image_paths = list(image_groups)
     random.shuffle(image_paths)
-    split_index = max(1, min(len(image_paths) - 1, round(len(image_paths) * 0.8)))
+    split_index = max(1, min(len(image_paths) - 1, round(len(image_paths) * config['train_test_split'])))
     train_indices = [index for path in image_paths[:split_index] for index in image_groups[path]]
     test_indices = [index for path in image_paths[split_index:] for index in image_groups[path]]
     train_samples = [full_dataset.samples[index] for index in train_indices]
@@ -244,7 +281,7 @@ def main():
         annotation_file,
         set(task_ids),
         training=True,
-        repeats=args.augmentation_repeats,
+        repeats=training_config['augmentation_repeats'],
         samples=train_samples,
     )
     test_dataset = KeypointDataset(
@@ -252,33 +289,38 @@ def main():
         set(task_ids),
         samples=test_samples,
     )
-    train_loader = make_loader(train_dataset, args.batch_size, args.workers)
-    test_loader = make_loader(test_dataset, args.batch_size, args.workers)
+    train_loader = make_loader(train_dataset, training_config['batch_size'], args.workers)
+    test_loader = make_loader(test_dataset, training_config['batch_size'], args.workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DinoCC(NUM_JOINTS, IMAGE_SIZE, freeze_backbone=True).to(device)
+    model = DinoCC(
+        NUM_JOINTS,
+        IMAGE_SIZE,
+        freeze_backbone=backbone_config['freeze_backbone'],
+        split_ratio=SIMCC_SPLIT_RATIO,
+        neck_dim=head_config['neck']['channels'],
+    ).to(device)
     criterion = SimCCLoss().to(device)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        lr=training_config['learning_rate'],
+        weight_decay=training_config['weight_decay'],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_config['max_epochs'])
     scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    best_path = run_dir / 'best.pt'
     print(
         f'Training on {device}; '
         f'train images={split_index}/{len(image_paths)}, '
         f'test images={len(image_paths) - split_index}/{len(image_paths)}'
     )
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler, True)
-        val_loss = run_epoch(model, test_loader, criterion, optimizer, device, scaler, False)
+    for epoch in range(1, training_config['max_epochs'] + 1):
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler, True, training_config['gradient_clip_norm'])
+        val_loss = run_epoch(model, test_loader, criterion, optimizer, device, scaler, False, training_config['gradient_clip_norm'])
         scheduler.step()
         print(f'Epoch {epoch:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}')
 
@@ -292,19 +334,20 @@ def main():
                     'keypoint_ids': KEYPOINT_IDS,
                     'joint_loss_weights': JOINT_LOSS_WEIGHTS,
                     'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
-                    'split': '80/20 by image',
+                    'config_path': str(run_config_path),
+                    'split': f'{config["train_test_split"]:.2f} by image',
                     'epoch': epoch,
                     'val_loss': val_loss,
                 },
-                output_path,
+                best_path,
             )
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= args.patience:
-                print(f'Early stopping after {args.patience} epochs without improvement.')
+            if epochs_without_improvement >= training_config['early_stopping_patience']:
+                print(f"Early stopping after {training_config['early_stopping_patience']} epochs without improvement.")
                 break
 
-    final_path = output_path.with_name(f'{output_path.stem}_final{output_path.suffix}')
+    final_path = run_dir / 'final.pt'
     torch.save(
         {
             'model_state_dict': model.state_dict(),
@@ -312,13 +355,14 @@ def main():
             'keypoint_ids': KEYPOINT_IDS,
             'joint_loss_weights': JOINT_LOSS_WEIGHTS,
             'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
-            'split': '80/20 by image',
-            'epoch': args.epochs,
+            'config_path': str(run_config_path),
+            'split': f'{config["train_test_split"]:.2f} by image',
+            'epoch': epoch,
             'test_loss': val_loss,
         },
         final_path,
     )
-    print(f'Saved best checkpoint to {output_path}')
+    print(f'Saved best checkpoint to {best_path}')
     print(f'Saved final checkpoint to {final_path}')
 
 
