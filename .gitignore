@@ -1,2 +1,5 @@
 /weights
 /.vscode
+/datasets
+/__pycache__
+/test
