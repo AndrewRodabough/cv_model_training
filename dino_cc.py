@@ -8,13 +8,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import NamedTuple, Tuple
 
-try:
-    from vec import IVec2
-except ModuleNotFoundError:
-    class IVec2(NamedTuple):
-        x: int
-        y: int
-
+from vec import IVec2
 
 class BaseSimCCHead(nn.Module, ABC):
   """Formal interface for any SimCC head variant."""
