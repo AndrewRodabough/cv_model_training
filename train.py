@@ -4,22 +4,80 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from typing import Any
 
 import numpy as np
+from dataclasses import dataclass
+from requests import head
 import yaml
 from PIL import Image, ImageEnhance, ImageOps
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
-try:
-    from vec import IVec2
-except ModuleNotFoundError:
-    from typing import NamedTuple
 
-    class IVec2(NamedTuple):
-        x: int
-        y: int
+from vec import IVec2
+
+
+@dataclass
+class DatasetConfig:
+    name: str
+    annotation_version: str
+    annotation_file: str 
+
+@dataclass
+class ImageConfig:
+    width: int
+    height: int
+    bbox_padding: float
+
+@dataclass
+class BackboneConfig:
+    name: str
+    type: str
+    patch_size: int
+    hidden_size: int
+
+@dataclass
+class HeadConfig:
+    name: str
+    type: str
+    keypoint_format_name: str
+    keypoints: dict
+    in_channels: int
+    out_channels: int
+    normalization: str
+    groups: int
+    activation: str
+    custom: Any
+
+@dataclass
+class SimCCConfig:
+    pointwise_convolutions: int
+    depthwise_kernel: int
+    split_ratio: float
+    x_bins: int
+    y_bins: int
+    gaussian_sigma: float
+    pooling: str
+
+@dataclass
+class TrainingConfig:
+    seed: int
+    batch_size: int
+    max_epochs: int
+    early_stopping_patience: int
+    learning_rate: float
+    weight_decay: float
+    train_test_split: float
+    gradient_clip_norm: float
+    augmentation_repeats: int
+
+@dataclass
+class keypoint_mapping:
+    name: str
+    num_keypoints: int
+    keypoints: dict
 
 
 IMAGE_SIZE = IVec2(336, 448)
@@ -67,12 +125,16 @@ IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
+
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
 
 
 def parse_person(person):
@@ -103,13 +165,12 @@ def horizontally_flip_keypoints(keypoints):
 
 
 class KeypointDataset(Dataset):
-    def __init__(self, annotation_file, task_ids, training=False, repeats=1, samples=None):
-        self.annotation_file = Path(annotation_file)
-        self.image_root = self.annotation_file.parent
+    def __init__(self, annotation_file: Path, task_ids, training=False, repeats=1, samples=None):
+        self.image_root = annotation_file.parent
         self.training = training
         self.repeats = repeats if training else 1
         if samples is None:
-            root = ET.parse(self.annotation_file).getroot()
+            root = ET.parse(annotation_file).getroot()
             samples = []
             for video in root.findall('./project/videos/video'):
                 if video.get('id') not in task_ids:
@@ -224,6 +285,91 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, training, gra
     return total_loss / len(loader.dataset)
 
 
+
+def create_run_dir(runs_dir, config_path):
+    run_date = datetime.now().strftime('%Y_%m_%d')
+
+    run_number = 1
+    while (runs_dir / f'{run_date}_{run_number:03d}').exists():
+        run_number += 1
+
+    run_dir = runs_dir / f'{run_date}_{run_number:03d}'
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    run_config_path = run_dir / 'config.yaml'
+    shutil.copy2(config_path, run_config_path)
+
+    return run_dir, run_config_path
+
+
+def load_keypoint_format(format_name):
+    mapping_path = Path('mapping')
+    standard_map = mapping_path / 'standard.yaml'
+    format_map = mapping_path / f'{format_name}.yaml'
+
+    if not format_map.exists():
+        raise ValueError(f'Keypoint format mapping file not found: {format_map}')
+    with open(format_map, 'r') as f:
+        format_mapping_cfg = keypoint_mapping(**yaml.safe_load(f))
+
+    return format_mapping_cfg.keypoints
+
+def get_annotation_file_path(annotation_version: str) -> Path:
+    # Parse version parts (e.g., '1.2.0' -> major='1', minor='2', patch='0')
+    parts = annotation_version.split(".")
+    if len(parts) != 3:
+        raise ValueError(
+            f"Expected semantic version format 'X.Y.Z', got: {annotation_version}"
+        )
+
+    major, minor, _ = parts
+    major_dir = f"{major}.X"
+    minor_dir = f"{major}.{minor}.X"
+
+    annotation_file = (
+        Path("dataset")
+        / "versions"
+        / major_dir
+        / minor_dir
+        / annotation_version
+        / "cleaned_annotations.xml"
+    )
+
+    if not annotation_file.exists():
+        raise ValueError(f"Annotation file not found: {annotation_file}")
+
+    return annotation_file
+
+
+def parse_config(raw_config):
+    image_cfg = ImageConfig(**raw_config['image'])
+    backbone_cfg = BackboneConfig(**raw_config['backbone'])
+    training_cfg = TrainingConfig(**raw_config['training'])
+
+
+    dataset_cfg = DatasetConfig(**raw_config['dataset'], annotation_file='')
+    annotation_path = Path('annotations')
+    dataset_cfg.annotation_file = str(annotation_path / f'annotations_{dataset_cfg.annotation_version}.xml')
+
+
+    head_cfg = HeadConfig(**raw_config['head'], keypoints={})
+    head_cfg.keypoints = load_keypoint_format(head_cfg.keypoint_format_name)
+
+    match (head_cfg.type):
+        case 'simcc':
+            head_cfg.custom = SimCCConfig(**head_cfg.custom)
+        case _:
+            raise ValueError(f'Unsupported head type: {head_cfg.type}')
+
+
+    return {
+        'dataset': dataset_cfg,
+        'image': image_cfg,
+        'backbone': backbone_cfg,
+        'head': head_cfg,
+        'training': training_cfg,
+    }
+
 def main():
     parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
     parser.add_argument('--config', default='config.yaml')
@@ -232,38 +378,29 @@ def main():
 
     config_path = Path(args.config).resolve()
     with open(config_path, encoding='utf-8') as config_file:
-        config = yaml.safe_load(config_file)
+        raw_config = yaml.safe_load(config_file)
+    config = parse_config(raw_config)
 
     runs_dir = Path('training/runs')
-    run_date = datetime.now().strftime('%Y_%m_%d')
-    run_number = 1
-    while (runs_dir / f'{run_date}_{run_number:03d}').exists():
-        run_number += 1
-    run_dir = runs_dir / f'{run_date}_{run_number:03d}'
-    run_dir.mkdir(parents=True, exist_ok=False)
-    run_config_path = run_dir / 'config.yaml'
-    shutil.copy2(config_path, run_config_path)
+    run_dir, run_config_path = create_run_dir(runs_dir, config_path)
 
-    image_config = config['image_input']
-    training_config = config['training']
-    head_config = config['head']
-    backbone_config = config['backbone']
-    global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
-    IMAGE_SIZE = IVec2(image_config['width'], image_config['height'])
-    KEYPOINT_IDS = list(head_config['keypoint_ids'])
-    KEYPOINT_INDEX = {point_id: index for index, point_id in enumerate(KEYPOINT_IDS)}
-    NUM_JOINTS = len(KEYPOINT_IDS)
-    BBOX_PADDING = image_config['bbox_padding']
-    SIMCC_SPLIT_RATIO = head_config['simcc']['split_ratio']
-    SIMCC_SIGMA = head_config['simcc']['gaussian_sigma']
-    if head_config['type'] != 'simcc' or head_config['name'] != 'depthwise_simcc':
-        raise ValueError('This trainer supports only the depthwise_simcc head.')
-    if backbone_config['name'] != 'dino_v2_base':
-        raise ValueError('This trainer supports only dino_v2_base.')
+    dataset_cfg: DatasetConfig = config['dataset']
+    image_cfg: ImageConfig = config['image']
+    training_cfg: TrainingConfig = config['training']
+    head_cfg: HeadConfig = config['head']
+    backbone_cfg: BackboneConfig = config['backbone']
 
-    annotations_path = Path(config['annotations'])
-    set_seed(config.get('seed', 42))
-    annotation_file = annotations_path
+    global IMAGE_SIZE, KEYPOINTS_BY_NAME, KEYPOINTS_BY_ID, KEYPOINT_INDEX, NUM_JOINTS, BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
+    IMAGE_SIZE = IVec2(image_cfg.width, image_cfg.height)
+    KEYPOINTS_BY_NAME = head_cfg.keypoints
+    KEYPOINTS_BY_ID = {id: {'name': name, 'standard_id': standard_id} for name, (id, standard_id) in KEYPOINTS_BY_NAME.items()}
+    NUM_JOINTS = len(head_cfg.keypoints)
+    BBOX_PADDING = image_cfg.bbox_padding
+
+
+    set_seed(training_cfg.seed)
+
+    annotation_file = get_annotation_file_path(dataset_cfg.annotation_version)
     root = ET.parse(annotation_file).getroot()
     task_ids = [video.get('id') for video in root.findall('./project/videos/video')]
     full_dataset = KeypointDataset(annotation_file, set(task_ids))
@@ -272,7 +409,7 @@ def main():
         image_groups.setdefault(image_path, []).append(index)
     image_paths = list(image_groups)
     random.shuffle(image_paths)
-    split_index = max(1, min(len(image_paths) - 1, round(len(image_paths) * config['train_test_split'])))
+    split_index = max(1, min(len(image_paths) - 1, round(len(image_paths) * training_cfg.train_test_split)))
     train_indices = [index for path in image_paths[:split_index] for index in image_groups[path]]
     test_indices = [index for path in image_paths[split_index:] for index in image_groups[path]]
     train_samples = [full_dataset.samples[index] for index in train_indices]
@@ -281,7 +418,7 @@ def main():
         annotation_file,
         set(task_ids),
         training=True,
-        repeats=training_config['augmentation_repeats'],
+        repeats=training_cfg.augmentation_repeats,
         samples=train_samples,
     )
     test_dataset = KeypointDataset(
@@ -289,24 +426,35 @@ def main():
         set(task_ids),
         samples=test_samples,
     )
-    train_loader = make_loader(train_dataset, training_config['batch_size'], args.workers)
-    test_loader = make_loader(test_dataset, training_config['batch_size'], args.workers)
+    train_loader = make_loader(train_dataset, training_cfg.batch_size, args.workers)
+    test_loader = make_loader(test_dataset, training_cfg.batch_size, args.workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DinoCC(
-        NUM_JOINTS,
-        IMAGE_SIZE,
-        freeze_backbone=backbone_config['freeze_backbone'],
-        split_ratio=SIMCC_SPLIT_RATIO,
-        neck_dim=head_config['neck']['channels'],
-    ).to(device)
-    criterion = SimCCLoss().to(device)
+
+    match backbone_cfg.name:
+        case 'dino_v2_base':
+            match head_cfg.type:
+                case 'simcc':
+                    model = DinoCC(
+                        NUM_JOINTS,
+                        IMAGE_SIZE,
+                        freeze_backbone=True,
+                        split_ratio=SIMCC_SPLIT_RATIO,
+                        neck_dim=head_cfg.out_channels,
+                    ).to(device)
+                    criterion = SimCCLoss().to(device)
+                case _:
+                    raise ValueError(f'Unsupported head type for backbone {backbone_cfg.name}: {head_cfg.type}')
+        case _:
+            raise ValueError(f'Unsupported backbone type: {backbone_cfg.name}')
+
+
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=training_config['learning_rate'],
-        weight_decay=training_config['weight_decay'],
+        lr=training_cfg.learning_rate,
+        weight_decay=training_cfg.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_config['max_epochs'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_cfg.max_epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
     best_val_loss = float('inf')
@@ -318,9 +466,9 @@ def main():
         f'test images={len(image_paths) - split_index}/{len(image_paths)}'
     )
 
-    for epoch in range(1, training_config['max_epochs'] + 1):
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler, True, training_config['gradient_clip_norm'])
-        val_loss = run_epoch(model, test_loader, criterion, optimizer, device, scaler, False, training_config['gradient_clip_norm'])
+    for epoch in range(1, training_cfg.max_epochs + 1):
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler, True, training_cfg.gradient_clip_norm)
+        val_loss = run_epoch(model, test_loader, criterion, optimizer, device, scaler, False, training_cfg.gradient_clip_norm)
         scheduler.step()
         print(f'Epoch {epoch:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}')
 
@@ -335,7 +483,8 @@ def main():
                     'joint_loss_weights': JOINT_LOSS_WEIGHTS,
                     'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
                     'config_path': str(run_config_path),
-                    'split': f'{config["train_test_split"]:.2f} by image',
+                    'seed': training_cfg.seed,
+                    'split': f'{training_cfg.train_test_split:.2f} by image',
                     'epoch': epoch,
                     'val_loss': val_loss,
                 },
@@ -343,8 +492,8 @@ def main():
             )
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= training_config['early_stopping_patience']:
-                print(f"Early stopping after {training_config['early_stopping_patience']} epochs without improvement.")
+            if epochs_without_improvement >= training_cfg.early_stopping_patience:
+                print(f"Early stopping after {training_cfg.early_stopping_patience} epochs without improvement.")
                 break
 
     final_path = run_dir / 'final.pt'
@@ -356,7 +505,8 @@ def main():
             'joint_loss_weights': JOINT_LOSS_WEIGHTS,
             'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
             'config_path': str(run_config_path),
-            'split': f'{config["train_test_split"]:.2f} by image',
+            'seed': training_cfg.seed,
+            'split': f'{training_cfg.train_test_split:.2f} by image',
             'epoch': epoch,
             'test_loss': val_loss,
         },
