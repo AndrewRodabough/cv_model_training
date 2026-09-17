@@ -38,6 +38,7 @@ class DepthwiseSimCCHead(BaseSimCCHead):
       out_size: IVec2,
       split_ratio: float = 2.0,
       neck_dim: int = 256,
+      **kwargs,
   ):
     super().__init__()
     self.grid_size = grid_size
@@ -94,14 +95,108 @@ class DepthwiseSimCCHead(BaseSimCCHead):
     return pred_x, pred_y
 
 
+class _JointQueryDecoderLayer(nn.Module):
+  def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+    super().__init__()
+    self.norm_q = nn.LayerNorm(dim)
+    self.norm_kv = nn.LayerNorm(dim)
+    self.cross_attn = nn.MultiheadAttention(
+        embed_dim=dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        batch_first=True,
+    )
+    self.norm_ffn = nn.LayerNorm(dim)
+    self.ffn = nn.Sequential(
+        nn.Linear(dim, dim * 4),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim * 4, dim),
+        nn.Dropout(dropout),
+    )
+
+  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    q = self.norm_q(queries)
+    kv = self.norm_kv(memory)
+    attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    queries = queries + attn_out
+    queries = queries + self.ffn(self.norm_ffn(queries))
+    return queries
+
+
+class JointQuerySimCCHead(BaseSimCCHead):
+  """Learnable joint queries with cross-attention over patch tokens, then SimCC X/Y heads."""
+
+  def __init__(
+      self,
+      in_channels: int,
+      num_joints: int,
+      grid_size: IVec2,
+      out_size: IVec2,
+      split_ratio: float = 2.0,
+      neck_dim: int = 256,
+      num_heads: int = 8,
+      num_layers: int = 2,
+      dropout: float = 0.0,
+      **kwargs,
+  ):
+    super().__init__()
+    if neck_dim % num_heads != 0:
+      raise ValueError(f'neck_dim ({neck_dim}) must be divisible by num_heads ({num_heads})')
+
+    self.grid_size = grid_size
+    self.neck_dim = neck_dim
+    self.num_joints = num_joints
+    self.out_bins_size = IVec2(
+        int(out_size.x * split_ratio), int(out_size.y * split_ratio)
+    )
+
+    self.input_proj = nn.Linear(in_channels, neck_dim)
+    self.joint_queries = nn.Parameter(torch.randn(num_joints, neck_dim) * 0.02)
+    self.patch_pos_embed = nn.Parameter(
+        torch.randn(1, grid_size.x * grid_size.y, neck_dim) * 0.02
+    )
+    self.layers = nn.ModuleList(
+        [_JointQueryDecoderLayer(neck_dim, num_heads, dropout) for _ in range(num_layers)]
+    )
+    self.fc_x = nn.Linear(neck_dim, self.out_bins_size.x)
+    self.fc_y = nn.Linear(neck_dim, self.out_bins_size.y)
+
+  def forward(self, patch_tokens: torch.Tensor):
+    B, N, _ = patch_tokens.shape
+    expected_n = self.grid_size.x * self.grid_size.y
+    if N != expected_n:
+      raise ValueError(
+          f'Expected {expected_n} patch tokens for grid {self.grid_size.x}x{self.grid_size.y}, got {N}'
+      )
+
+    memory = self.input_proj(patch_tokens) + self.patch_pos_embed
+    queries = self.joint_queries.unsqueeze(0).expand(B, -1, -1)
+    for layer in self.layers:
+      queries = layer(queries, memory)
+
+    pred_x = self.fc_x(queries)
+    pred_y = self.fc_y(queries)
+    return pred_x, pred_y
+
+
+HEAD_REGISTRY = {
+    'depthwise_simcc': DepthwiseSimCCHead,
+    'joint_query_simcc': JointQuerySimCCHead,
+}
+
+
 class DinoCC(nn.Module):
     def __init__(self, num_joints: int, img_size: IVec2, freeze_backbone: bool = True,
                  split_ratio: float = 2.0, neck_dim: int = 256,
-                 backbone_name: str = 'facebook/dinov2-base'):
+                 backbone_name: str = 'facebook/dinov2-base',
+                 head_name: str = 'depthwise_simcc',
+                 head_kwargs: dict | None = None):
         super().__init__()
         self.num_joints = num_joints
         self.img_size = img_size
         self.backbone_name = backbone_name
+        self.head_name = head_name
 
         # Load pre-trained ViT backbone
         self.backbone = AutoModel.from_pretrained(backbone_name)
@@ -121,15 +216,22 @@ class DinoCC(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-        # Create custom head
-        self.head = DepthwiseSimCCHead(
-            in_channels=self.backbone.config.hidden_size,
-            num_joints=self.num_joints,
-            grid_size=self.grid_size,
-            out_size=IVec2(self.img_size.x, self.img_size.y),
-            split_ratio=split_ratio,
-            neck_dim=neck_dim
-        )
+        if head_name not in HEAD_REGISTRY:
+            raise ValueError(
+                f'Unknown head_name={head_name!r}; expected one of {sorted(HEAD_REGISTRY)}'
+            )
+        head_cls = HEAD_REGISTRY[head_name]
+        kwargs = {
+            'in_channels': self.backbone.config.hidden_size,
+            'num_joints': self.num_joints,
+            'grid_size': self.grid_size,
+            'out_size': IVec2(self.img_size.x, self.img_size.y),
+            'split_ratio': split_ratio,
+            'neck_dim': neck_dim,
+        }
+        if head_kwargs:
+            kwargs.update(head_kwargs)
+        self.head = head_cls(**kwargs)
 
     def load_weights(self, checkpoint_path, map_location='cpu', strict=True):
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
@@ -152,7 +254,6 @@ class DinoCC(nn.Module):
         # Predict 1D coordinates
         pred_x, pred_y = self.head(patch_tokens)
         return pred_x, pred_y
-
 
 
 def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0):

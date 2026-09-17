@@ -136,6 +136,10 @@ def main():
         num_joints=len(KEYPOINT_IDS),
         img_size=IVec2(IMAGE_SIZE.x, IMAGE_SIZE.y),
         backbone_name=checkpoint.get('backbone_name', 'facebook/dinov2-base'),
+        head_name=checkpoint.get('head_name', 'depthwise_simcc'),
+        head_kwargs=checkpoint.get('head_kwargs'),
+        neck_dim=checkpoint.get('neck_dim', 256),
+        split_ratio=checkpoint.get('split_ratio', 2.0),
     ).to(device)
     model.load_weights(args.weights, map_location=device)
     model.eval()
