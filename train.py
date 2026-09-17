@@ -62,6 +62,16 @@ class SimCCConfig:
     pooling: str
 
 @dataclass
+class JointQuerySimCCConfig:
+    split_ratio: float
+    x_bins: int
+    y_bins: int
+    gaussian_sigma: float
+    num_heads: int = 8
+    num_layers: int = 2
+    dropout: float = 0.0
+
+@dataclass
 class TrainingConfig:
     seed: int
     batch_size: int
@@ -76,6 +86,12 @@ class TrainingConfig:
     worst_test_overlays: int = 10
     # frame: random images; stratified_clip: every clip in both sets; clip: whole videos
     split_mode: str = 'frame'
+    # Train-time augmentation (applied when KeypointDataset.training=True)
+    aug_scale_min: float = 0.85
+    aug_scale_max: float = 1.25
+    aug_shift_frac: float = 0.1
+    aug_rotation_deg: float = 12.0
+    aug_color_jitter: float = 0.25
 
 @dataclass
 class keypoint_mapping:
@@ -97,6 +113,11 @@ LEFT_RIGHT_PAIRS: list[tuple[int, int]] = []
 JOINT_LOSS_WEIGHTS = torch.empty(0)
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+AUG_SCALE_MIN = 0.85
+AUG_SCALE_MAX = 1.25
+AUG_SHIFT_FRAC = 0.1
+AUG_ROTATION_DEG = 12.0
+AUG_COLOR_JITTER = 0.25
 
 
 
@@ -136,6 +157,34 @@ def horizontally_flip_keypoints(keypoints):
     return flipped
 
 
+def rotate_image_and_keypoints(image: Image.Image, keypoints: np.ndarray, angle_deg: float):
+    """Rotate crop and keypoints together (CCW, same as PIL). Mark OOB joints invisible."""
+    if abs(angle_deg) < 1e-6:
+        return image, keypoints
+
+    rotated = image.rotate(angle_deg, resample=Image.Resampling.BILINEAR, expand=False)
+    width, height = image.size
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    theta = np.deg2rad(angle_deg)
+    cos_t = float(np.cos(theta))
+    sin_t = float(np.sin(theta))
+
+    out = keypoints.copy()
+    x = keypoints[:, 0] - cx
+    y = keypoints[:, 1] - cy
+    out[:, 0] = cx + x * cos_t - y * sin_t
+    out[:, 1] = cy + x * sin_t + y * cos_t
+    out_of_bounds = (
+        (out[:, 0] < 0)
+        | (out[:, 1] < 0)
+        | (out[:, 0] >= width)
+        | (out[:, 1] >= height)
+    )
+    out[out_of_bounds, 2] = 0.0
+    return rotated, out
+
+
 class KeypointDataset(Dataset):
     def __init__(self, annotation_file: Path, task_ids, training=False, repeats=1, samples=None):
         self.image_root = annotation_file.parent
@@ -166,8 +215,22 @@ class KeypointDataset(Dataset):
         image = Image.open(image_path).convert('RGB')
         original_width, original_height = image.size
 
+        if self.training:
+            scale = random.uniform(AUG_SCALE_MIN, AUG_SCALE_MAX)
+            shift_x_frac = random.uniform(-AUG_SHIFT_FRAC, AUG_SHIFT_FRAC)
+            shift_y_frac = random.uniform(-AUG_SHIFT_FRAC, AUG_SHIFT_FRAC)
+        else:
+            scale = 1.0
+            shift_x_frac = 0.0
+            shift_y_frac = 0.0
+
         crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
-            bbox, original_width, original_height
+            bbox,
+            original_width,
+            original_height,
+            scale=scale,
+            shift_x_frac=shift_x_frac,
+            shift_y_frac=shift_y_frac,
         )
         image = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
         image = image.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
@@ -180,9 +243,14 @@ class KeypointDataset(Dataset):
             if random.random() < 0.5:
                 image = ImageOps.mirror(image)
                 keypoints = horizontally_flip_keypoints(keypoints)
-            image = ImageEnhance.Brightness(image).enhance(random.uniform(0.85, 1.15))
-            image = ImageEnhance.Contrast(image).enhance(random.uniform(0.85, 1.15))
-            image = ImageEnhance.Color(image).enhance(random.uniform(0.85, 1.15))
+            if AUG_ROTATION_DEG > 0:
+                angle = random.uniform(-AUG_ROTATION_DEG, AUG_ROTATION_DEG)
+                image, keypoints = rotate_image_and_keypoints(image, keypoints, angle)
+            color_lo = 1.0 - AUG_COLOR_JITTER
+            color_hi = 1.0 + AUG_COLOR_JITTER
+            image = ImageEnhance.Brightness(image).enhance(random.uniform(color_lo, color_hi))
+            image = ImageEnhance.Contrast(image).enhance(random.uniform(color_lo, color_hi))
+            image = ImageEnhance.Color(image).enhance(random.uniform(color_lo, color_hi))
 
         pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255.0
         pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
@@ -229,6 +297,7 @@ def setup_from_config(config):
     global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, KEYPOINTS_BY_NAME
     global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
     global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS
+    global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
 
     image_cfg: ImageConfig = config['image']
     head_cfg: HeadConfig = config['head']
@@ -251,6 +320,21 @@ def setup_from_config(config):
 
     IMAGE_SIZE = IVec2(image_cfg.width, image_cfg.height)
     BBOX_PADDING = image_cfg.bbox_padding
+    AUG_SCALE_MIN = training_cfg.aug_scale_min
+    AUG_SCALE_MAX = training_cfg.aug_scale_max
+    AUG_SHIFT_FRAC = training_cfg.aug_shift_frac
+    AUG_ROTATION_DEG = training_cfg.aug_rotation_deg
+    AUG_COLOR_JITTER = training_cfg.aug_color_jitter
+    if AUG_SCALE_MIN <= 0 or AUG_SCALE_MAX < AUG_SCALE_MIN:
+        raise ValueError(
+            f'Invalid aug scale range: [{AUG_SCALE_MIN}, {AUG_SCALE_MAX}]'
+        )
+    if AUG_SHIFT_FRAC < 0:
+        raise ValueError(f'aug_shift_frac must be >= 0, got {AUG_SHIFT_FRAC}')
+    if AUG_ROTATION_DEG < 0:
+        raise ValueError(f'aug_rotation_deg must be >= 0, got {AUG_ROTATION_DEG}')
+    if AUG_COLOR_JITTER < 0 or AUG_COLOR_JITTER >= 1:
+        raise ValueError(f'aug_color_jitter must be in [0, 1), got {AUG_COLOR_JITTER}')
 
     ordered = sorted(head_cfg.keypoints.items(), key=lambda item: item[1]['id'])
     local_ids = [meta['id'] for _, meta in ordered]
@@ -264,7 +348,7 @@ def setup_from_config(config):
     NUM_JOINTS = len(ordered)
 
     if head_cfg.type == 'simcc':
-        simcc: SimCCConfig = head_cfg.custom
+        simcc = head_cfg.custom
         SIMCC_SPLIT_RATIO = simcc.split_ratio
         SIMCC_SIGMA = simcc.gaussian_sigma
         expected_x = int(image_cfg.width * simcc.split_ratio)
@@ -284,8 +368,20 @@ def setup_from_config(config):
     )
 
 
-def compute_padded_crop(bbox, original_width, original_height):
-    """Return (crop_x1, crop_y1, crop_width, crop_height) matching KeypointDataset."""
+def compute_padded_crop(
+    bbox,
+    original_width,
+    original_height,
+    *,
+    scale: float = 1.0,
+    shift_x_frac: float = 0.0,
+    shift_y_frac: float = 0.0,
+):
+    """Return (crop_x1, crop_y1, crop_width, crop_height) matching KeypointDataset.
+
+    ``scale`` zooms the crop ( >1 = zoom out). ``shift_*_frac`` offsets the crop
+    center by a fraction of the (pre-clamp) crop size.
+    """
     x1, y1, x2, y2 = bbox
     bbox_width = x2 - x1
     bbox_height = y2 - y1
@@ -299,8 +395,12 @@ def compute_padded_crop(bbox, original_width, original_height):
         bbox_height * (1 + 2 * BBOX_PADDING),
         crop_width * IMAGE_SIZE.y / IMAGE_SIZE.x,
     )
+    crop_width = crop_width * scale
+    crop_height = crop_height * scale
     crop_width = min(crop_width, original_width)
     crop_height = min(crop_height, original_height)
+    center_x = center_x + shift_x_frac * crop_width
+    center_y = center_y + shift_y_frac * crop_height
     crop_x1 = max(0.0, min(center_x - crop_width / 2, original_width - crop_width))
     crop_y1 = max(0.0, min(center_y - crop_height / 2, original_height - crop_height))
     return crop_x1, crop_y1, crop_width, crop_height
@@ -502,12 +602,19 @@ def parse_config(raw_config):
     head_cfg.keypoints = keypoint_format.keypoints
     head_cfg.left_right_pairs = keypoint_format.left_right_pairs
 
-    match (head_cfg.type):
-        case 'simcc':
-            head_cfg.custom = SimCCConfig(**head_cfg.custom)
-        case _:
-            raise ValueError(f'Unsupported head type: {head_cfg.type}')
+    if head_cfg.type != 'simcc':
+        raise ValueError(f'Unsupported head type: {head_cfg.type}')
 
+    match head_cfg.name:
+        case 'depthwise_simcc':
+            head_cfg.custom = SimCCConfig(**head_cfg.custom)
+        case 'joint_query_simcc':
+            head_cfg.custom = JointQuerySimCCConfig(**head_cfg.custom)
+        case _:
+            raise ValueError(
+                f'Unsupported head name: {head_cfg.name}; '
+                f"expected 'depthwise_simcc' or 'joint_query_simcc'"
+            )
 
     return {
         'dataset': dataset_cfg,
@@ -774,6 +881,13 @@ def main():
         case 'dino_v2_base' | 'dino_v3_base':
             match head_cfg.type:
                 case 'simcc':
+                    head_kwargs = {}
+                    if head_cfg.name == 'joint_query_simcc':
+                        head_kwargs = {
+                            'num_heads': head_cfg.custom.num_heads,
+                            'num_layers': head_cfg.custom.num_layers,
+                            'dropout': head_cfg.custom.dropout,
+                        }
                     model = DinoCC(
                         NUM_JOINTS,
                         IMAGE_SIZE,
@@ -781,12 +895,21 @@ def main():
                         split_ratio=SIMCC_SPLIT_RATIO,
                         neck_dim=head_cfg.out_channels,
                         backbone_name=backbone_hf_ids[backbone_cfg.name],
+                        head_name=head_cfg.name,
+                        head_kwargs=head_kwargs,
                     ).to(device)
                     criterion = SimCCLoss().to(device)
                 case _:
                     raise ValueError(f'Unsupported head type for backbone {backbone_cfg.name}: {head_cfg.type}')
         case _:
             raise ValueError(f'Unsupported backbone type: {backbone_cfg.name}')
+
+    head_checkpoint_meta = {
+        'head_name': head_cfg.name,
+        'head_kwargs': head_kwargs if head_cfg.name == 'joint_query_simcc' else {},
+        'neck_dim': head_cfg.out_channels,
+        'split_ratio': SIMCC_SPLIT_RATIO,
+    }
 
 
     optimizer = torch.optim.AdamW(
@@ -824,6 +947,10 @@ def main():
                     'joint_loss_weights': training_cfg.joint_loss_weights,
                     'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
                     'backbone_name': backbone_hf_ids[backbone_cfg.name],
+                    'head_name': head_checkpoint_meta['head_name'],
+                    'head_kwargs': head_checkpoint_meta['head_kwargs'],
+                    'neck_dim': head_checkpoint_meta['neck_dim'],
+                    'split_ratio': head_checkpoint_meta['split_ratio'],
                     'config_path': str(run_config_path),
                     'seed': training_cfg.seed,
                     'split': split_label,
@@ -847,6 +974,10 @@ def main():
             'joint_loss_weights': training_cfg.joint_loss_weights,
             'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
             'backbone_name': backbone_hf_ids[backbone_cfg.name],
+            'head_name': head_checkpoint_meta['head_name'],
+            'head_kwargs': head_checkpoint_meta['head_kwargs'],
+            'neck_dim': head_checkpoint_meta['neck_dim'],
+            'split_ratio': head_checkpoint_meta['split_ratio'],
             'config_path': str(run_config_path),
             'seed': training_cfg.seed,
             'split': split_label,

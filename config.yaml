@@ -5,7 +5,7 @@ dataset:
 image:
   width: 384
   height: 512
-  bbox_padding: 0.0
+  bbox_padding: 0.05
 
 backbone:
   name: dino_v3_base
@@ -14,7 +14,7 @@ backbone:
   hidden_size: 768
 
 head:
-  name: depthwise_simcc
+  name: joint_query_simcc
   type: simcc
   keypoint_format_name: dance_20
   in_channels: 768
@@ -24,13 +24,13 @@ head:
   activation: gelu
 
   custom:
-    pointwise_convolutions: 2
-    depthwise_kernel: 3
     split_ratio: 2.0
     x_bins: 768
     y_bins: 1024
     gaussian_sigma: 6.0
-    pooling: adaptive_avg_pool2d
+    num_heads: 8
+    num_layers: 2
+    dropout: 0.0
 
 training:
   seed: 43
@@ -42,7 +42,12 @@ training:
   train_test_split: 0.8
   split_mode: stratified_clip
   gradient_clip_norm: 1.0
-  augmentation_repeats: 4
+  augmentation_repeats: 8
+  aug_scale_min: 0.85
+  aug_scale_max: 1.25
+  aug_shift_frac: 0.1
+  aug_rotation_deg: 12.0
+  aug_color_jitter: 0.25
   worst_test_overlays: 10
   joint_loss_weights:
     shoulder_l: 1.5
