@@ -2,7 +2,9 @@
 /.vscode
 /dataset
 /__pycache__
-/test
+/training
 /temp
 *.pt
 *.safetensors
+*.jpg
+*.png

@@ -19,21 +19,21 @@ keypoints:
   wrist_l:
     id: 5
     standard_id: 9
-  shoulder_l:
-    id: 6
-    standard_id: 5
   elbow_l:
-    id: 7
+    id: 6
     standard_id: 7
+  shoulder_l:
+    id: 7
+    standard_id: 5
   wrist_r:
     id: 8
     standard_id: 10
-  shoulder_r:
-    id: 9
-    standard_id: 6
   elbow_r:
-    id: 10
+    id: 9
     standard_id: 8
+  shoulder_r:
+    id: 10
+    standard_id: 6
   asis_l:
     id: 11
     standard_id: 20
@@ -85,3 +85,16 @@ keypoints:
   heel_spike_r:
     id: 27
     standard_id: 30
+left_right_pairs:
+  - [wrist_l, wrist_r]
+  - [shoulder_l, shoulder_r]
+  - [elbow_l, elbow_r]
+  - [hip_l, hip_r]
+  - [knee_l, knee_r]
+  - [ankle_l, ankle_r]
+  - [toe_b_l, toe_b_r]
+  - [toe_s_l, toe_s_r]
+  - [heel_l, heel_r]
+  - [heel_spike_l, heel_spike_r]
+  - [ear_l, ear_r]
+  - [asis_l, asis_r]

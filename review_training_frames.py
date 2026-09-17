@@ -8,22 +8,26 @@ import matplotlib.pyplot as plt
 
 
 SKELETON_CONNECTIONS = (
-    (6, 7),
-    (7, 8),
-    (9, 10),
-    (10, 11),
-    (15, 16),
-    (16, 17),
-    (18, 19),
-    (19, 20),
-    (17, 21),
-    (17, 22),
-    (17, 23),
-    (17, 24),
-    (20, 25),
-    (20, 26),
-    (20, 27),
-    (20, 28),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (5, 6),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+    (15, 23),
+    (15, 24),
+    (15, 25),
+    (15, 26),
+    (16, 27),
+    (16, 28),
+    (16, 29),
+    (16, 30),
 )
 
 
@@ -35,7 +39,11 @@ def person_color(person_id):
 def draw_person(image, person):
     person_id = person.get('person_id', person.get('track_id', 'unknown'))
     color = person_color(person_id)
-    bbox = tuple(float(person.get(name)) for name in ('bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2'))
+    bbox_element = person.find('bbox')
+    if bbox_element is not None:
+        bbox = tuple(float(bbox_element.get(name)) for name in ('x1', 'y1', 'x2', 'y2'))
+    else:
+        bbox = tuple(float(person.get(name)) for name in ('bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2'))
     x1, y1, x2, y2 = (round(value) for value in bbox)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
     cv2.putText(
@@ -84,7 +92,7 @@ def main():
     parser.add_argument(
         '--annotations',
         type=Path,
-        default=Path('datasets/cleaned_dataset_1.0_9-9/annotations/annotations.xml'),
+        default=Path('dataset/versions/1.X/1.2.X/1.2.0/cleaned_annotations.xml'),
     )
     parser.add_argument('--start', type=int, default=0, help='Frame position at which to start.')
     parser.add_argument('--video-id', help='Review only one video/task ID.')

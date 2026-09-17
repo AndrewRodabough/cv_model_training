@@ -85,7 +85,7 @@ def draw_prediction(image, coordinates, crop_info, output_path):
         draw.rectangle(
             (crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height),
             outline='yellow',
-            width=3,
+            width=1,
         )
 
     points = []
@@ -94,17 +94,17 @@ def draw_prediction(image, coordinates, crop_info, output_path):
         original_y = crop_y1 + y * crop_height / IMAGE_SIZE.y
         points.append((original_x, original_y))
 
-    for index, (x, y) in enumerate(points):
-        radius = 5
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill='red', outline='white')
-        draw.text((x + 6, y - 6), str(KEYPOINT_IDS[index]), fill='white', stroke_width=2, stroke_fill='black')
-
     point_by_id = dict(zip(KEYPOINT_IDS, points))
     for first_id, second_id in SKELETON_CONNECTIONS:
         first = point_by_id.get(first_id)
         second = point_by_id.get(second_id)
         if first is not None and second is not None:
-            draw.line((first, second), fill='lime', width=2)
+            draw.line((first, second), fill='lime', width=1)
+
+    for index, (x, y) in enumerate(points):
+        radius = 2
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill='red', outline='white')
+        draw.text((x + 4, y - 4), str(KEYPOINT_IDS[index]), fill='white', stroke_width=1, stroke_fill='black')
 
     image.save(output_path)
 
@@ -132,7 +132,11 @@ def main():
             f'Checkpoint keypoints {checkpoint_keypoint_ids} do not match this inference script {KEYPOINT_IDS}.'
         )
 
-    model = DinoCC(num_joints=len(KEYPOINT_IDS), img_size=IVec2(IMAGE_SIZE.x, IMAGE_SIZE.y)).to(device)
+    model = DinoCC(
+        num_joints=len(KEYPOINT_IDS),
+        img_size=IVec2(IMAGE_SIZE.x, IMAGE_SIZE.y),
+        backbone_name=checkpoint.get('backbone_name', 'facebook/dinov2-base'),
+    ).to(device)
     model.load_weights(args.weights, map_location=device)
     model.eval()
 
