@@ -96,16 +96,26 @@ class DepthwiseSimCCHead(BaseSimCCHead):
 
 class DinoCC(nn.Module):
     def __init__(self, num_joints: int, img_size: IVec2, freeze_backbone: bool = True,
-                 split_ratio: float = 2.0, neck_dim: int = 256):
+                 split_ratio: float = 2.0, neck_dim: int = 256,
+                 backbone_name: str = 'facebook/dinov2-base'):
         super().__init__()
-        self.patch_size = 14
         self.num_joints = num_joints
         self.img_size = img_size
-        self.grid_size = IVec2(self.img_size.x // self.patch_size, self.img_size.y // self.patch_size)
+        self.backbone_name = backbone_name
 
         # Load pre-trained ViT backbone
-        self.backbone = AutoModel.from_pretrained('facebook/dinov2-base')
-        
+        self.backbone = AutoModel.from_pretrained(backbone_name)
+        self.patch_size = self.backbone.config.patch_size
+        self.num_register_tokens = getattr(self.backbone.config, 'num_register_tokens', 0) or 0
+
+        if self.img_size.x % self.patch_size != 0 or self.img_size.y % self.patch_size != 0:
+            raise ValueError(
+                f'Image size {self.img_size.x}x{self.img_size.y} must be divisible by '
+                f'backbone patch size {self.patch_size}'
+            )
+
+        self.grid_size = IVec2(self.img_size.x // self.patch_size, self.img_size.y // self.patch_size)
+
         # Freeze backbone weights
         if freeze_backbone:
             for param in self.backbone.parameters():
@@ -129,12 +139,16 @@ class DinoCC(nn.Module):
 
 
     def forward(self, pixel_values):
-        # Extract features through DINOv2
-        outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
-        
-        # Hugging Face token index 0 is [CLS]; tokens 1: are the spatial patches
-        patch_tokens = outputs.last_hidden_state[:, 1:, :] # [B, N, 768]
-        
+        # DINOv2 needs pos-encoding interpolation for non-native resolutions; DINOv3 uses RoPE
+        if getattr(self.backbone.config, 'model_type', None) == 'dinov2':
+            outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
+        else:
+            outputs = self.backbone(pixel_values=pixel_values)
+
+        # Token 0 is [CLS]; DINOv3 (and some DINOv2 variants) insert register tokens before patches
+        patch_start = 1 + self.num_register_tokens
+        patch_tokens = outputs.last_hidden_state[:, patch_start:, :]  # [B, N, C]
+
         # Predict 1D coordinates
         pred_x, pred_y = self.head(patch_tokens)
         return pred_x, pred_y

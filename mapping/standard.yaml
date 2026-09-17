@@ -94,3 +94,17 @@ keypoints:
   heel_spike_r:
     id: 30
     standard_id: 30
+left_right_pairs:
+  - [wrist_l, wrist_r]
+  - [shoulder_l, shoulder_r]
+  - [elbow_l, elbow_r]
+  - [hip_l, hip_r]
+  - [knee_l, knee_r]
+  - [ankle_l, ankle_r]
+  - [toe_b_l, toe_b_r]
+  - [toe_s_l, toe_s_r]
+  - [heel_l, heel_r]
+  - [heel_spike_l, heel_spike_r]
+  - [ear_l, ear_r]
+  - [asis_l, asis_r]
+  - [eye_l, eye_r]
