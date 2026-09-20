@@ -1,6 +1,8 @@
 import argparse
+import csv
 import random
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -16,6 +18,46 @@ from torch.utils.data import DataLoader, Dataset
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
 
 from vec import IVec2
+
+
+class StdoutCsvTee:
+    """Mirror stdout line-by-line into a CSV log while still printing to the console."""
+
+    def __init__(self, stream, csv_path: Path):
+        self.stream = stream
+        self._buffer = ''
+        self._file = open(csv_path, 'w', newline='', encoding='utf-8')
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(['timestamp', 'message'])
+        self._file.flush()
+
+    def write(self, data):
+        self.stream.write(data)
+        if not isinstance(data, str):
+            data = str(data)
+        self._buffer += data
+        while '\n' in self._buffer:
+            line, self._buffer = self._buffer.split('\n', 1)
+            self._writer.writerow([datetime.now().isoformat(timespec='seconds'), line])
+            self._file.flush()
+        return len(data)
+
+    def flush(self):
+        self.stream.flush()
+        self._file.flush()
+
+    def close(self):
+        if self._buffer:
+            self._writer.writerow([datetime.now().isoformat(timespec='seconds'), self._buffer])
+            self._buffer = ''
+            self._file.flush()
+        self._file.close()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 @dataclass
@@ -832,6 +874,16 @@ def main():
     runs_dir = Path('training/runs')
     run_dir, run_config_path = create_run_dir(runs_dir, config_path)
 
+    log_tee = StdoutCsvTee(sys.stdout, run_dir / 'log.csv')
+    sys.stdout = log_tee
+    try:
+        _run_training(args, config, run_dir, run_config_path)
+    finally:
+        sys.stdout = log_tee.stream
+        log_tee.close()
+
+
+def _run_training(args, config, run_dir, run_config_path):
     dataset_cfg: DatasetConfig = config['dataset']
     training_cfg: TrainingConfig = config['training']
     head_cfg: HeadConfig = config['head']
