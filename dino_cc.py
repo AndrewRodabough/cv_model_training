@@ -96,6 +96,8 @@ class DepthwiseSimCCHead(BaseSimCCHead):
 
 
 class _JointQueryDecoderLayer(nn.Module):
+  """Cross-attention over patch memory only (no query–query mixing)."""
+
   def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
     super().__init__()
     self.norm_q = nn.LayerNorm(dim)
@@ -124,8 +126,52 @@ class _JointQueryDecoderLayer(nn.Module):
     return queries
 
 
-class JointQuerySimCCHead(BaseSimCCHead):
-  """Learnable joint queries with cross-attention over patch tokens, then SimCC X/Y heads."""
+class _JointQuerySelfAttnDecoderLayer(nn.Module):
+  """DETR-style layer: self-attn among joint queries, then cross-attn to patches."""
+
+  def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+    super().__init__()
+    self.norm_self = nn.LayerNorm(dim)
+    self.self_attn = nn.MultiheadAttention(
+        embed_dim=dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        batch_first=True,
+    )
+    self.norm_q = nn.LayerNorm(dim)
+    self.norm_kv = nn.LayerNorm(dim)
+    self.cross_attn = nn.MultiheadAttention(
+        embed_dim=dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        batch_first=True,
+    )
+    self.norm_ffn = nn.LayerNorm(dim)
+    self.ffn = nn.Sequential(
+        nn.Linear(dim, dim * 4),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim * 4, dim),
+        nn.Dropout(dropout),
+    )
+
+  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    q_self = self.norm_self(queries)
+    self_out, _ = self.self_attn(q_self, q_self, q_self, need_weights=False)
+    queries = queries + self_out
+
+    q = self.norm_q(queries)
+    kv = self.norm_kv(memory)
+    cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    queries = queries + cross_out
+    queries = queries + self.ffn(self.norm_ffn(queries))
+    return queries
+
+
+class _BaseJointQuerySimCCHead(BaseSimCCHead):
+  """Shared joint-query → SimCC head; subclasses set ``_layer_cls``."""
+
+  _layer_cls = _JointQueryDecoderLayer
 
   def __init__(
       self,
@@ -157,7 +203,7 @@ class JointQuerySimCCHead(BaseSimCCHead):
         torch.randn(1, grid_size.x * grid_size.y, neck_dim) * 0.02
     )
     self.layers = nn.ModuleList(
-        [_JointQueryDecoderLayer(neck_dim, num_heads, dropout) for _ in range(num_layers)]
+        [self._layer_cls(neck_dim, num_heads, dropout) for _ in range(num_layers)]
     )
     self.fc_x = nn.Linear(neck_dim, self.out_bins_size.x)
     self.fc_y = nn.Linear(neck_dim, self.out_bins_size.y)
@@ -180,9 +226,22 @@ class JointQuerySimCCHead(BaseSimCCHead):
     return pred_x, pred_y
 
 
+class JointQuerySimCCHead(_BaseJointQuerySimCCHead):
+  """Learnable joint queries with cross-attention over patch tokens, then SimCC X/Y heads."""
+
+  _layer_cls = _JointQueryDecoderLayer
+
+
+class JointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
+  """Joint queries with self-attention among joints, then cross-attention to patches + SimCC."""
+
+  _layer_cls = _JointQuerySelfAttnDecoderLayer
+
+
 HEAD_REGISTRY = {
     'depthwise_simcc': DepthwiseSimCCHead,
     'joint_query_simcc': JointQuerySimCCHead,
+    'joint_query_self_attn_simcc': JointQuerySelfAttnSimCCHead,
 }
 
 
