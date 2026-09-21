@@ -650,12 +650,13 @@ def parse_config(raw_config):
     match head_cfg.name:
         case 'depthwise_simcc':
             head_cfg.custom = SimCCConfig(**head_cfg.custom)
-        case 'joint_query_simcc':
+        case 'joint_query_simcc' | 'joint_query_self_attn_simcc':
             head_cfg.custom = JointQuerySimCCConfig(**head_cfg.custom)
         case _:
             raise ValueError(
                 f'Unsupported head name: {head_cfg.name}; '
-                f"expected 'depthwise_simcc' or 'joint_query_simcc'"
+                f"expected 'depthwise_simcc', 'joint_query_simcc', "
+                f"or 'joint_query_self_attn_simcc'"
             )
 
     return {
@@ -934,7 +935,7 @@ def _run_training(args, config, run_dir, run_config_path):
             match head_cfg.type:
                 case 'simcc':
                     head_kwargs = {}
-                    if head_cfg.name == 'joint_query_simcc':
+                    if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
                         head_kwargs = {
                             'num_heads': head_cfg.custom.num_heads,
                             'num_layers': head_cfg.custom.num_layers,
@@ -958,7 +959,11 @@ def _run_training(args, config, run_dir, run_config_path):
 
     head_checkpoint_meta = {
         'head_name': head_cfg.name,
-        'head_kwargs': head_kwargs if head_cfg.name == 'joint_query_simcc' else {},
+        'head_kwargs': (
+            head_kwargs
+            if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc')
+            else {}
+        ),
         'neck_dim': head_cfg.out_channels,
         'split_ratio': SIMCC_SPLIT_RATIO,
     }
