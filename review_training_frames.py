@@ -20,14 +20,16 @@ SKELETON_CONNECTIONS = (
     (13, 15),
     (12, 14),
     (14, 16),
-    (15, 23),
-    (15, 24),
+    (25, 23),
+    (25, 24),
     (15, 25),
-    (15, 26),
-    (16, 27),
-    (16, 28),
+    (25, 26),
+    (23, 24),
+    (29, 27),
+    (29, 28),
     (16, 29),
-    (16, 30),
+    (29, 30),
+    (27, 28),
 )
 
 
@@ -92,7 +94,7 @@ def main():
     parser.add_argument(
         '--annotations',
         type=Path,
-        default=Path('dataset/versions/1.X/1.2.X/1.2.0/cleaned_annotations.xml'),
+        default=Path('dataset/versions/1.X/1.3.X/1.3.5/cleaned_annotations.xml'),
     )
     parser.add_argument('--start', type=int, default=0, help='Frame position at which to start.')
     parser.add_argument('--video-id', help='Review only one video/task ID.')

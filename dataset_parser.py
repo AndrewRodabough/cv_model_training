@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-DATASET_DIR = Path('dataset/versions/1.X/1.3.X/1.3.0')
+DATASET_DIR = Path('dataset/versions/1.X/1.3.X/1.3.5')
 ANNOTATIONS_FILE = DATASET_DIR / 'annotations.xml'
 IMAGES_DIR = Path('dataset/image_store')
 OUTPUT_ANNOTATIONS_FILE = DATASET_DIR / 'cleaned_annotations.xml'
