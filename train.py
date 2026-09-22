@@ -16,6 +16,14 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
+from metrics import (
+    compute_oks,
+    decode_simcc,
+    format_metrics_summary,
+    person_scale_in_crop,
+    summarize_pose_metrics,
+    write_metrics_json,
+)
 
 from vec import IVec2
 
@@ -92,6 +100,7 @@ class HeadConfig:
     activation: str
     custom: Any
     left_right_pairs: list | None = None
+    oks_sigmas: dict[str, float] | None = None
 
 @dataclass
 class SimCCConfig:
@@ -126,6 +135,7 @@ class TrainingConfig:
     augmentation_repeats: int
     joint_loss_weights: dict[str, float]
     worst_test_overlays: int = 10
+    compute_ap: bool = True
     # frame: random images; stratified_clip: every clip in both sets; clip: whole videos
     split_mode: str = 'frame'
     # Train-time augmentation (applied when KeypointDataset.training=True)
@@ -141,6 +151,7 @@ class keypoint_mapping:
     num_keypoints: int
     keypoints: dict
     left_right_pairs: list | None = None
+    oks_sigmas: dict[str, float] | None = None
 
 
 IMAGE_SIZE = IVec2(384, 512)
@@ -153,6 +164,7 @@ SIMCC_SPLIT_RATIO = 2.0
 SIMCC_SIGMA = 6.0
 LEFT_RIGHT_PAIRS: list[tuple[int, int]] = []
 JOINT_LOSS_WEIGHTS = torch.empty(0)
+OKS_SIGMAS = torch.empty(0)
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 AUG_SCALE_MIN = 0.85
@@ -334,11 +346,24 @@ def build_left_right_index_pairs(pairs: list | None, keypoints_by_name: dict) ->
     return index_pairs
 
 
+def build_oks_sigmas(oks_sigmas: dict[str, float] | None, keypoints_by_name: dict) -> torch.Tensor:
+    """Build [K] OKS sigma tensor ordered by local joint id."""
+    ordered = sorted(keypoints_by_name.items(), key=lambda item: item[1]['id'])
+    if not oks_sigmas:
+        raise ValueError(
+            'oks_sigmas missing from keypoint format mapping; required when compute_ap is enabled'
+        )
+    missing = [name for name, _ in ordered if name not in oks_sigmas]
+    if missing:
+        raise ValueError(f'oks_sigmas missing joints: {missing}')
+    return torch.tensor([float(oks_sigmas[name]) for name, _ in ordered], dtype=torch.float32)
+
+
 def setup_from_config(config):
     """Apply image / SimCC / keypoint globals from the parsed config."""
     global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, KEYPOINTS_BY_NAME
     global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
-    global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS
+    global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS, OKS_SIGMAS
     global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
 
     image_cfg: ImageConfig = config['image']
@@ -408,6 +433,10 @@ def setup_from_config(config):
     LEFT_RIGHT_PAIRS = build_left_right_index_pairs(
         head_cfg.left_right_pairs, head_cfg.keypoints
     )
+    if head_cfg.oks_sigmas:
+        OKS_SIGMAS = build_oks_sigmas(head_cfg.oks_sigmas, head_cfg.keypoints)
+    else:
+        OKS_SIGMAS = torch.empty(0)
 
 
 def compute_padded_crop(
@@ -643,6 +672,7 @@ def parse_config(raw_config):
     keypoint_format = load_keypoint_format(head_cfg.keypoint_format_name)
     head_cfg.keypoints = keypoint_format.keypoints
     head_cfg.left_right_pairs = keypoint_format.left_right_pairs
+    head_cfg.oks_sigmas = keypoint_format.oks_sigmas
 
     if head_cfg.type != 'simcc':
         raise ValueError(f'Unsupported head type: {head_cfg.type}')
@@ -668,6 +698,63 @@ def parse_config(raw_config):
     }
 
 
+BACKBONE_HF_IDS = {
+    'dino_v2_base': 'facebook/dinov2-base',
+    'dino_v3_base': 'facebook/dinov3-vitb16-pretrain-lvd1689m',
+}
+
+
+def build_model(config, device):
+    """Construct a DinoCC model from a parsed config on ``device``."""
+    head_cfg: HeadConfig = config['head']
+    backbone_cfg: BackboneConfig = config['backbone']
+
+    match backbone_cfg.name:
+        case 'dino_v2_base' | 'dino_v3_base':
+            match head_cfg.type:
+                case 'simcc':
+                    head_kwargs = {}
+                    if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
+                        head_kwargs = {
+                            'num_heads': head_cfg.custom.num_heads,
+                            'num_layers': head_cfg.custom.num_layers,
+                            'dropout': head_cfg.custom.dropout,
+                        }
+                    return DinoCC(
+                        NUM_JOINTS,
+                        IMAGE_SIZE,
+                        freeze_backbone=True,
+                        split_ratio=SIMCC_SPLIT_RATIO,
+                        neck_dim=head_cfg.out_channels,
+                        backbone_name=BACKBONE_HF_IDS[backbone_cfg.name],
+                        head_name=head_cfg.name,
+                        head_kwargs=head_kwargs,
+                    ).to(device)
+                case _:
+                    raise ValueError(
+                        f'Unsupported head type for backbone {backbone_cfg.name}: {head_cfg.type}'
+                    )
+        case _:
+            raise ValueError(f'Unsupported backbone type: {backbone_cfg.name}')
+
+
+def load_test_samples(config):
+    """Rebuild the train/test split and return the test person-samples."""
+    dataset_cfg: DatasetConfig = config['dataset']
+    training_cfg: TrainingConfig = config['training']
+    annotation_file = get_annotation_file_path(dataset_cfg.annotation_version)
+    root = ET.parse(annotation_file).getroot()
+    task_ids = [video.get('id') for video in root.findall('./project/videos/video')]
+    full_dataset = KeypointDataset(annotation_file, set(task_ids))
+    _, test_samples, _, _ = split_samples_by_image(
+        full_dataset.samples,
+        training_cfg.train_test_split,
+        training_cfg.seed,
+        split_mode=training_cfg.split_mode,
+    )
+    return test_samples
+
+
 def build_skeleton_connections(keypoints_by_name: dict) -> list[tuple[int, int]]:
     name_links = (
         ('shoulder_l', 'elbow_l'),
@@ -682,14 +769,16 @@ def build_skeleton_connections(keypoints_by_name: dict) -> list[tuple[int, int]]
         ('knee_l', 'ankle_l'),
         ('hip_r', 'knee_r'),
         ('knee_r', 'ankle_r'),
-        ('ankle_l', 'toe_b_l'),
-        ('ankle_l', 'toe_s_l'),
+        ('heel_l', 'toe_b_l'),
+        ('heel_l', 'toe_s_l'),
         ('ankle_l', 'heel_l'),
-        ('ankle_l', 'heel_spike_l'),
-        ('ankle_r', 'toe_b_r'),
-        ('ankle_r', 'toe_s_r'),
+        ('heel_l', 'heel_spike_l'),
+        ('toe_b_l', 'toe_s_l'),
+        ('heel_r', 'toe_b_r'),
+        ('heel_r', 'toe_s_r'),
         ('ankle_r', 'heel_r'),
-        ('ankle_r', 'heel_spike_r'),
+        ('heel_r', 'heel_spike_r'),
+        ('toe_b_r', 'toe_s_r'),
     )
     connections = []
     for left_name, right_name in name_links:
@@ -861,6 +950,94 @@ def export_worst_test_overlays(model, checkpoint_path, test_samples, output_dir,
     return worst
 
 
+@torch.inference_mode()
+def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, batch_size):
+    """Score best/final checkpoint with OKS-AP (primary) and SimCC loss (secondary)."""
+    if OKS_SIGMAS.numel() == 0:
+        raise ValueError('OKS_SIGMAS is empty; keypoint format must define oks_sigmas')
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    sigmas = OKS_SIGMAS.detach().cpu().numpy()
+    records = []
+
+    for start in range(0, len(test_samples), batch_size):
+        batch = test_samples[start:start + batch_size]
+        pixels_batch = []
+        keypoints_batch = []
+        scales = []
+
+        for image_path, keypoints, bbox in batch:
+            image = Image.open(image_path).convert('RGB')
+            crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+                bbox, image.width, image.height
+            )
+            crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+            crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+            pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
+            pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+            crop_keypoints = transform_keypoints_to_crop(
+                keypoints, crop_x1, crop_y1, crop_width, crop_height
+            )
+            pixels_batch.append(pixels)
+            keypoints_batch.append(torch.from_numpy(crop_keypoints))
+            scales.append(
+                person_scale_in_crop(
+                    bbox,
+                    crop_width,
+                    crop_height,
+                    IMAGE_SIZE.x,
+                    IMAGE_SIZE.y,
+                )
+            )
+
+        pixels_tensor = torch.stack(pixels_batch).to(device)
+        keypoints_tensor = torch.stack(keypoints_batch)
+        target_x, target_y, weights = make_targets(keypoints_tensor, device)
+
+        with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+            pred_x, pred_y = model(pixels_tensor)
+            sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
+            coords, joint_conf = decode_simcc(pred_x, pred_y, SIMCC_SPLIT_RATIO)
+
+        coords_np = coords.detach().cpu().numpy()
+        conf_np = joint_conf.detach().cpu().numpy()
+        keypoints_np = keypoints_tensor.numpy()
+        losses_np = sample_losses.detach().cpu().numpy()
+
+        for offset, (image_path, _keypoints, _bbox) in enumerate(batch):
+            gt = keypoints_np[offset]
+            visible = gt[:, 2] > 0
+            if np.any(visible):
+                score = float(conf_np[offset, visible].mean())
+            else:
+                score = float(conf_np[offset].mean())
+            oks = compute_oks(coords_np[offset], gt, sigmas, scales[offset])
+            records.append(
+                {
+                    'video_id': clip_id_from_image_path(image_path),
+                    'oks': oks,
+                    'loss': float(losses_np[offset]),
+                    'score': score,
+                }
+            )
+
+    return summarize_pose_metrics(records)
+
+
+def export_checkpoint_metrics(model, checkpoint_path, test_samples, output_dir, device, batch_size):
+    metrics = evaluate_checkpoint_metrics(
+        model, checkpoint_path, test_samples, device, batch_size
+    )
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_metrics_json(metrics, output_dir / 'metrics.json')
+    print(format_metrics_summary(output_dir.name, metrics))
+    return metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
     parser.add_argument('--config', default='config.yaml')
@@ -925,42 +1102,17 @@ def _run_training(args, config, run_dir, run_config_path):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    backbone_hf_ids = {
-        'dino_v2_base': 'facebook/dinov2-base',
-        'dino_v3_base': 'facebook/dinov3-vitb16-pretrain-lvd1689m',
-    }
-
-    match backbone_cfg.name:
-        case 'dino_v2_base' | 'dino_v3_base':
-            match head_cfg.type:
-                case 'simcc':
-                    head_kwargs = {}
-                    if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
-                        head_kwargs = {
-                            'num_heads': head_cfg.custom.num_heads,
-                            'num_layers': head_cfg.custom.num_layers,
-                            'dropout': head_cfg.custom.dropout,
-                        }
-                    model = DinoCC(
-                        NUM_JOINTS,
-                        IMAGE_SIZE,
-                        freeze_backbone=True,
-                        split_ratio=SIMCC_SPLIT_RATIO,
-                        neck_dim=head_cfg.out_channels,
-                        backbone_name=backbone_hf_ids[backbone_cfg.name],
-                        head_name=head_cfg.name,
-                        head_kwargs=head_kwargs,
-                    ).to(device)
-                    criterion = SimCCLoss().to(device)
-                case _:
-                    raise ValueError(f'Unsupported head type for backbone {backbone_cfg.name}: {head_cfg.type}')
-        case _:
-            raise ValueError(f'Unsupported backbone type: {backbone_cfg.name}')
+    model = build_model(config, device)
+    criterion = SimCCLoss().to(device)
 
     head_checkpoint_meta = {
         'head_name': head_cfg.name,
         'head_kwargs': (
-            head_kwargs
+            {
+                'num_heads': head_cfg.custom.num_heads,
+                'num_layers': head_cfg.custom.num_layers,
+                'dropout': head_cfg.custom.dropout,
+            }
             if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc')
             else {}
         ),
@@ -1003,7 +1155,7 @@ def _run_training(args, config, run_dir, run_config_path):
                     'keypoint_ids': KEYPOINT_IDS,
                     'joint_loss_weights': training_cfg.joint_loss_weights,
                     'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
-                    'backbone_name': backbone_hf_ids[backbone_cfg.name],
+                    'backbone_name': BACKBONE_HF_IDS[backbone_cfg.name],
                     'head_name': head_checkpoint_meta['head_name'],
                     'head_kwargs': head_checkpoint_meta['head_kwargs'],
                     'neck_dim': head_checkpoint_meta['neck_dim'],
@@ -1030,7 +1182,7 @@ def _run_training(args, config, run_dir, run_config_path):
             'keypoint_ids': KEYPOINT_IDS,
             'joint_loss_weights': training_cfg.joint_loss_weights,
             'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
-            'backbone_name': backbone_hf_ids[backbone_cfg.name],
+            'backbone_name': BACKBONE_HF_IDS[backbone_cfg.name],
             'head_name': head_checkpoint_meta['head_name'],
             'head_kwargs': head_checkpoint_meta['head_kwargs'],
             'neck_dim': head_checkpoint_meta['neck_dim'],
@@ -1061,6 +1213,26 @@ def _run_training(args, config, run_dir, run_config_path):
                 test_samples=test_samples,
                 output_dir=run_dir / checkpoint_name,
                 top_n=training_cfg.worst_test_overlays,
+                device=device,
+                batch_size=training_cfg.batch_size,
+            )
+
+    if training_cfg.compute_ap:
+        if OKS_SIGMAS.numel() == 0:
+            raise ValueError(
+                'compute_ap=true requires oks_sigmas in the keypoint format mapping '
+                f'({head_cfg.keypoint_format_name})'
+            )
+        print('Evaluating OKS-AP on test set for best and final checkpoints...')
+        for checkpoint_name, checkpoint_path in (('best', best_path), ('final', final_path)):
+            if not checkpoint_path.exists():
+                print(f'Skipping AP for {checkpoint_name}: missing {checkpoint_path}')
+                continue
+            export_checkpoint_metrics(
+                model=model,
+                checkpoint_path=checkpoint_path,
+                test_samples=test_samples,
+                output_dir=run_dir / checkpoint_name,
                 device=device,
                 batch_size=training_cfg.batch_size,
             )
