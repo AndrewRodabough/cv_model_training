@@ -1,0 +1,96 @@
+name: dance_20
+num_keypoints: 20
+keypoints:
+  wrist_l:
+    id: 0
+    standard_id: 9
+  shoulder_l:
+    id: 1
+    standard_id: 5
+  elbow_l:
+    id: 2
+    standard_id: 7
+  wrist_r:
+    id: 3
+    standard_id: 10
+  shoulder_r:
+    id: 4
+    standard_id: 6
+  elbow_r:
+    id: 5
+    standard_id: 8
+  hip_l:
+    id: 6
+    standard_id: 11
+  knee_l:
+    id: 7
+    standard_id: 13
+  ankle_l:
+    id: 8
+    standard_id: 15
+  hip_r:
+    id: 9
+    standard_id: 12
+  knee_r:
+    id: 10
+    standard_id: 14
+  ankle_r:
+    id: 11
+    standard_id: 16
+  toe_b_l:
+    id: 12
+    standard_id: 23
+  toe_s_l:
+    id: 13
+    standard_id: 24
+  heel_l:
+    id: 14
+    standard_id: 25
+  heel_spike_l:
+    id: 15
+    standard_id: 26
+  toe_b_r:
+    id: 16
+    standard_id: 27
+  toe_s_r:
+    id: 17
+    standard_id: 28
+  heel_r:
+    id: 18
+    standard_id: 29
+  heel_spike_r:
+    id: 19
+    standard_id: 30
+left_right_pairs:
+  - [wrist_l, wrist_r]
+  - [shoulder_l, shoulder_r]
+  - [elbow_l, elbow_r]
+  - [hip_l, hip_r]
+  - [knee_l, knee_r]
+  - [ankle_l, ankle_r]
+  - [toe_b_l, toe_b_r]
+  - [toe_s_l, toe_s_r]
+  - [heel_l, heel_r]
+  - [heel_spike_l, heel_spike_r]
+# COCO-style OKS sigmas (fraction of person scale). Foot tips use ankle-like values.
+oks_sigmas:
+  shoulder_l: 0.079
+  shoulder_r: 0.079
+  elbow_l: 0.072
+  elbow_r: 0.072
+  wrist_l: 0.062
+  wrist_r: 0.062
+  hip_l: 0.107
+  hip_r: 0.107
+  knee_l: 0.087
+  knee_r: 0.087
+  ankle_l: 0.089
+  ankle_r: 0.089
+  toe_b_l: 0.089
+  toe_b_r: 0.089
+  toe_s_l: 0.089
+  toe_s_r: 0.089
+  heel_l: 0.089
+  heel_r: 0.089
+  heel_spike_l: 0.089
+  heel_spike_r: 0.089

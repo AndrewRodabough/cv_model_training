@@ -1,3 +1,4 @@
+import argparse
 import copy
 import os
 import xml.etree.ElementTree as ET
@@ -5,11 +6,33 @@ from pathlib import Path
 
 import yaml
 
-DATASET_DIR = Path('dataset/versions/1.X/1.3.X/1.3.5')
-ANNOTATIONS_FILE = DATASET_DIR / 'annotations.xml'
 IMAGES_DIR = Path('dataset/image_store')
-OUTPUT_ANNOTATIONS_FILE = DATASET_DIR / 'cleaned_annotations.xml'
 CVAT_MAPPING_FILE = Path('mapping/cvat_dance_28.yaml')
+
+# Set in main() from --version / positional version.
+DATASET_DIR: Path
+ANNOTATIONS_FILE: Path
+OUTPUT_ANNOTATIONS_FILE: Path
+
+
+def resolve_dataset_dir(annotation_version: str) -> Path:
+    """Map 'X.Y.Z' -> dataset/versions/X.X/X.Y.X/X.Y.Z (same layout as train.py)."""
+    parts = annotation_version.split('.')
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise ValueError(
+            f"Expected semantic version format 'X.Y.Z', got: {annotation_version}"
+        )
+    major, minor, _ = parts
+    dataset_dir = (
+        Path('dataset')
+        / 'versions'
+        / f'{major}.X'
+        / f'{major}.{minor}.X'
+        / annotation_version
+    )
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(f'Dataset version directory not found: {dataset_dir}')
+    return dataset_dir
 
 
 def attribute_value(element, name):
@@ -233,6 +256,39 @@ def build_annotations():
 
 
 def main():
+    global DATASET_DIR, ANNOTATIONS_FILE, OUTPUT_ANNOTATIONS_FILE, IMAGES_DIR, CVAT_MAPPING_FILE
+
+    parser = argparse.ArgumentParser(
+        description='Build cleaned_annotations.xml for a dataset annotation version.'
+    )
+    parser.add_argument(
+        'version',
+        help="Annotation version, e.g. '1.4.0' -> dataset/versions/1.X/1.4.X/1.4.0",
+    )
+    parser.add_argument(
+        '--images',
+        type=Path,
+        default=Path('dataset/image_store'),
+        help='Image store directory (default: dataset/image_store)',
+    )
+    parser.add_argument(
+        '--mapping',
+        type=Path,
+        default=Path('mapping/cvat_dance_28.yaml'),
+        help='CVAT label mapping YAML (default: mapping/cvat_dance_28.yaml)',
+    )
+    args = parser.parse_args()
+
+    DATASET_DIR = resolve_dataset_dir(args.version)
+    ANNOTATIONS_FILE = DATASET_DIR / 'annotations.xml'
+    OUTPUT_ANNOTATIONS_FILE = DATASET_DIR / 'cleaned_annotations.xml'
+    IMAGES_DIR = args.images
+    CVAT_MAPPING_FILE = args.mapping
+
+    if not ANNOTATIONS_FILE.is_file():
+        raise FileNotFoundError(f'Missing annotations XML: {ANNOTATIONS_FILE}')
+
+    print(f'Dataset dir: {DATASET_DIR}')
     image_count, track_count, via_completion, via_frame_cleaned = build_annotations()
     print(f'Created {image_count} unique images.')
     print(f'Created {track_count} cleaned tracks.')

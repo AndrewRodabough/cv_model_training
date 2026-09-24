@@ -1,0 +1,88 @@
+metadata:
+  name: pth-dinocc-dance-20
+  namespace: cvat
+  annotations:
+    name: DinoCC Dance 20
+    type: detector
+    framework: pytorch
+    description: Top-down DinoCC SimCC pose (dance_20 / standard keypoint names)
+    spec: |
+      [
+        {
+          "name": "body",
+          "type": "skeleton",
+          "svg": "<svg width=\"100\" height=\"200\" xmlns=\"http://www.w3.org/2000/svg\"><line x1=\"35\" y1=\"35\" x2=\"22\" y2=\"55\" data-type=\"edge\" data-node-from=\"1\" data-node-to=\"2\"/><line x1=\"22\" y1=\"55\" x2=\"15\" y2=\"75\" data-type=\"edge\" data-node-from=\"2\" data-node-to=\"0\"/><line x1=\"65\" y1=\"35\" x2=\"78\" y2=\"55\" data-type=\"edge\" data-node-from=\"4\" data-node-to=\"5\"/><line x1=\"78\" y1=\"55\" x2=\"85\" y2=\"75\" data-type=\"edge\" data-node-from=\"5\" data-node-to=\"3\"/><line x1=\"35\" y1=\"35\" x2=\"65\" y2=\"35\" data-type=\"edge\" data-node-from=\"1\" data-node-to=\"4\"/><line x1=\"35\" y1=\"35\" x2=\"40\" y2=\"85\" data-type=\"edge\" data-node-from=\"1\" data-node-to=\"6\"/><line x1=\"65\" y1=\"35\" x2=\"60\" y2=\"85\" data-type=\"edge\" data-node-from=\"4\" data-node-to=\"9\"/><line x1=\"40\" y1=\"85\" x2=\"60\" y2=\"85\" data-type=\"edge\" data-node-from=\"6\" data-node-to=\"9\"/><line x1=\"40\" y1=\"85\" x2=\"38\" y2=\"120\" data-type=\"edge\" data-node-from=\"6\" data-node-to=\"7\"/><line x1=\"38\" y1=\"120\" x2=\"36\" y2=\"155\" data-type=\"edge\" data-node-from=\"7\" data-node-to=\"8\"/><line x1=\"60\" y1=\"85\" x2=\"62\" y2=\"120\" data-type=\"edge\" data-node-from=\"9\" data-node-to=\"10\"/><line x1=\"62\" y1=\"120\" x2=\"64\" y2=\"155\" data-type=\"edge\" data-node-from=\"10\" data-node-to=\"11\"/><line x1=\"32\" y1=\"165\" x2=\"42\" y2=\"170\" data-type=\"edge\" data-node-from=\"14\" data-node-to=\"12\"/><line x1=\"32\" y1=\"165\" x2=\"48\" y2=\"168\" data-type=\"edge\" data-node-from=\"14\" data-node-to=\"13\"/><line x1=\"36\" y1=\"155\" x2=\"32\" y2=\"165\" data-type=\"edge\" data-node-from=\"8\" data-node-to=\"14\"/><line x1=\"32\" y1=\"165\" x2=\"28\" y2=\"175\" data-type=\"edge\" data-node-from=\"14\" data-node-to=\"15\"/><line x1=\"42\" y1=\"170\" x2=\"48\" y2=\"168\" data-type=\"edge\" data-node-from=\"12\" data-node-to=\"13\"/><line x1=\"68\" y1=\"165\" x2=\"58\" y2=\"170\" data-type=\"edge\" data-node-from=\"18\" data-node-to=\"16\"/><line x1=\"68\" y1=\"165\" x2=\"52\" y2=\"168\" data-type=\"edge\" data-node-from=\"18\" data-node-to=\"17\"/><line x1=\"64\" y1=\"155\" x2=\"68\" y2=\"165\" data-type=\"edge\" data-node-from=\"11\" data-node-to=\"18\"/><line x1=\"68\" y1=\"165\" x2=\"72\" y2=\"175\" data-type=\"edge\" data-node-from=\"18\" data-node-to=\"19\"/><line x1=\"58\" y1=\"170\" x2=\"52\" y2=\"168\" data-type=\"edge\" data-node-from=\"16\" data-node-to=\"17\"/><circle r=\"1.5\" cx=\"15\" cy=\"75\" data-type=\"element node\" data-element-id=\"0\" data-label-name=\"wrist_l\"/><circle r=\"1.5\" cx=\"35\" cy=\"35\" data-type=\"element node\" data-element-id=\"1\" data-label-name=\"shoulder_l\"/><circle r=\"1.5\" cx=\"22\" cy=\"55\" data-type=\"element node\" data-element-id=\"2\" data-label-name=\"elbow_l\"/><circle r=\"1.5\" cx=\"85\" cy=\"75\" data-type=\"element node\" data-element-id=\"3\" data-label-name=\"wrist_r\"/><circle r=\"1.5\" cx=\"65\" cy=\"35\" data-type=\"element node\" data-element-id=\"4\" data-label-name=\"shoulder_r\"/><circle r=\"1.5\" cx=\"78\" cy=\"55\" data-type=\"element node\" data-element-id=\"5\" data-label-name=\"elbow_r\"/><circle r=\"1.5\" cx=\"40\" cy=\"85\" data-type=\"element node\" data-element-id=\"6\" data-label-name=\"hip_l\"/><circle r=\"1.5\" cx=\"38\" cy=\"120\" data-type=\"element node\" data-element-id=\"7\" data-label-name=\"knee_l\"/><circle r=\"1.5\" cx=\"36\" cy=\"155\" data-type=\"element node\" data-element-id=\"8\" data-label-name=\"ankle_l\"/><circle r=\"1.5\" cx=\"60\" cy=\"85\" data-type=\"element node\" data-element-id=\"9\" data-label-name=\"hip_r\"/><circle r=\"1.5\" cx=\"62\" cy=\"120\" data-type=\"element node\" data-element-id=\"10\" data-label-name=\"knee_r\"/><circle r=\"1.5\" cx=\"64\" cy=\"155\" data-type=\"element node\" data-element-id=\"11\" data-label-name=\"ankle_r\"/><circle r=\"1.5\" cx=\"42\" cy=\"170\" data-type=\"element node\" data-element-id=\"12\" data-label-name=\"toe_b_l\"/><circle r=\"1.5\" cx=\"48\" cy=\"168\" data-type=\"element node\" data-element-id=\"13\" data-label-name=\"toe_s_l\"/><circle r=\"1.5\" cx=\"32\" cy=\"165\" data-type=\"element node\" data-element-id=\"14\" data-label-name=\"heel_l\"/><circle r=\"1.5\" cx=\"28\" cy=\"175\" data-type=\"element node\" data-element-id=\"15\" data-label-name=\"heel_spike_l\"/><circle r=\"1.5\" cx=\"58\" cy=\"170\" data-type=\"element node\" data-element-id=\"16\" data-label-name=\"toe_b_r\"/><circle r=\"1.5\" cx=\"52\" cy=\"168\" data-type=\"element node\" data-element-id=\"17\" data-label-name=\"toe_s_r\"/><circle r=\"1.5\" cx=\"68\" cy=\"165\" data-type=\"element node\" data-element-id=\"18\" data-label-name=\"heel_r\"/><circle r=\"1.5\" cx=\"72\" cy=\"175\" data-type=\"element node\" data-element-id=\"19\" data-label-name=\"heel_spike_r\"/></svg>",
+          "sublabels": [
+            {"id": 0,"name": "wrist_l","type": "points"},
+            {"id": 1,"name": "shoulder_l","type": "points"},
+            {"id": 2,"name": "elbow_l","type": "points"},
+            {"id": 3,"name": "wrist_r","type": "points"},
+            {"id": 4,"name": "shoulder_r","type": "points"},
+            {"id": 5,"name": "elbow_r","type": "points"},
+            {"id": 6,"name": "hip_l","type": "points"},
+            {"id": 7,"name": "knee_l","type": "points"},
+            {"id": 8,"name": "ankle_l","type": "points"},
+            {"id": 9,"name": "hip_r","type": "points"},
+            {"id": 10,"name": "knee_r","type": "points"},
+            {"id": 11,"name": "ankle_r","type": "points"},
+            {"id": 12,"name": "toe_b_l","type": "points"},
+            {"id": 13,"name": "toe_s_l","type": "points"},
+            {"id": 14,"name": "heel_l","type": "points"},
+            {"id": 15,"name": "heel_spike_l","type": "points"},
+            {"id": 16,"name": "toe_b_r","type": "points"},
+            {"id": 17,"name": "toe_s_r","type": "points"},
+            {"id": 18,"name": "heel_r","type": "points"},
+            {"id": 19,"name": "heel_spike_r","type": "points"}
+          ]
+        }
+      ]
+
+spec:
+  description: DinoCC dance_20 keypoints (DINOv3 + joint-query SimCC)
+  handler: main:handler
+  runtime: python:3.11
+  eventTimeout: 120s
+  build:
+    image: cvat.pth.dinocc.dance20
+    baseImage: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+    directives:
+      preCopy:
+        - kind: ENV
+          value: DEBIAN_FRONTEND=noninteractive
+        - kind: ENV
+          value: PIP_DISABLE_PIP_VERSION_CHECK=1
+        - kind: ENV
+          value: HF_HUB_OFFLINE=1
+        - kind: ENV
+          value: TRANSFORMERS_OFFLINE=1
+        - kind: RUN
+          value: >
+            apt-get update && apt-get install -y --no-install-recommends
+            libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+        - kind: RUN
+          value: >
+            pip install --no-cache-dir
+            "transformers>=4.56.0"
+            pillow
+            pyyaml
+            opencv-python-headless
+            "numpy<2"
+      postCopy:
+        - kind: WORKDIR
+          value: /opt/nuclio
+  triggers:
+    myHttpTrigger:
+      kind: http
+      maxWorkers: 1
+      workerAvailabilityTimeoutMilliseconds: 10000
+      attributes:
+        maxRequestBodySize: 33554432
+  resources:
+    limits:
+      nvidia.com/gpu: 1
+  platform:
+    attributes:
+      network: cvat_cvat
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
