@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 import cv2
 import matplotlib.pyplot as plt
 
+from dataset_parser import resolve_dataset_dir
+
 
 SKELETON_CONNECTIONS = (
     (5, 7),
@@ -92,15 +94,26 @@ def draw_person(image, person):
 def main():
     parser = argparse.ArgumentParser(description='Review training frames one at a time.')
     parser.add_argument(
+        'version',
+        help="Annotation version, e.g. '1.4.0' -> dataset/versions/1.X/1.4.X/1.4.0",
+    )
+    parser.add_argument(
         '--annotations',
         type=Path,
-        default=Path('dataset/versions/1.X/1.3.X/1.3.8/cleaned_annotations.xml'),
+        default=None,
+        help='Override path to cleaned_annotations.xml (default: <version dir>/cleaned_annotations.xml)',
     )
     parser.add_argument('--start', type=int, default=0, help='Frame position at which to start.')
     parser.add_argument('--video-id', help='Review only one video/task ID.')
     args = parser.parse_args()
 
-    root = ET.parse(args.annotations).getroot()
+    annotations = args.annotations or (
+        resolve_dataset_dir(args.version) / 'cleaned_annotations.xml'
+    )
+    if not annotations.is_file():
+        raise FileNotFoundError(f'Missing cleaned annotations: {annotations}')
+
+    root = ET.parse(annotations).getroot()
     frames = [
         (video, frame)
         for video in root.findall('./project/videos/video')
@@ -108,7 +121,7 @@ def main():
         for frame in video.findall('frame')
     ]
     if not frames:
-        raise ValueError(f'No frames found in {args.annotations}')
+        raise ValueError(f'No frames found in {annotations}')
     if not 0 <= args.start < len(frames):
         raise ValueError(f'--start must be between 0 and {len(frames) - 1}')
 
@@ -122,7 +135,7 @@ def main():
             return
 
         video, frame = frames[position]
-        image_path = (args.annotations.parent / frame.get('image')).resolve()
+        image_path = (annotations.parent / frame.get('image')).resolve()
         image = cv2.imread(str(image_path))
         if image is None:
             raise FileNotFoundError(f'Could not read image: {image_path}')
@@ -149,6 +162,7 @@ def main():
             plt.close(figure)
 
     figure.canvas.mpl_connect('key_press_event', handle_key)
+    print(f'Annotations: {annotations}')
     show_frame()
     plt.show()
     if state['position'] >= len(frames):

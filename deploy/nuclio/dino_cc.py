@@ -218,7 +218,7 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     super().__init__()
     if neck_dim % num_heads != 0:
       raise ValueError(f'neck_dim ({neck_dim}) must be divisible by num_heads ({num_heads})')
-    if not 0.0 < soft_foot_anchor_init < 1.0:
+    if soft_foot_anchor and not 0.0 < soft_foot_anchor_init < 1.0:
       raise ValueError(
           f'soft_foot_anchor_init must be in (0, 1), got {soft_foot_anchor_init}'
       )
