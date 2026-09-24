@@ -94,7 +94,7 @@ def main():
     parser.add_argument(
         '--annotations',
         type=Path,
-        default=Path('dataset/versions/1.X/1.3.X/1.3.5/cleaned_annotations.xml'),
+        default=Path('dataset/versions/1.X/1.3.X/1.3.8/cleaned_annotations.xml'),
     )
     parser.add_argument('--start', type=int, default=0, help='Frame position at which to start.')
     parser.add_argument('--video-id', help='Review only one video/task ID.')

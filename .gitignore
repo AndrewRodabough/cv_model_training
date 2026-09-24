@@ -8,3 +8,6 @@
 *.safetensors
 *.jpg
 *.png
+!deploy/nuclio/weights/.gitkeep
+deploy/nuclio/weights/*.pt
+deploy/nuclio/__pycache__/

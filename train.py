@@ -121,6 +121,9 @@ class JointQuerySimCCConfig:
     num_heads: int = 8
     num_layers: int = 2
     dropout: float = 0.0
+    # Soft-anchor foot queries to same-side ankle: q_foot += σ(α) * W(q_ankle)
+    soft_foot_anchor: bool = False
+    soft_foot_anchor_init: float = 0.4
 
 @dataclass
 class TrainingConfig:
@@ -344,6 +347,40 @@ def build_left_right_index_pairs(pairs: list | None, keypoints_by_name: dict) ->
             (keypoints_by_name[left_name]['id'], keypoints_by_name[right_name]['id'])
         )
     return index_pairs
+
+
+def build_foot_anchor_pairs(keypoints_by_name: dict) -> list[tuple[int, int]]:
+    """Map each foot tip local id → same-side ankle local id for soft query anchoring."""
+    pairs = []
+    for name, meta in sorted(keypoints_by_name.items(), key=lambda item: item[1]['id']):
+        if not (name.startswith('toe_') or name.startswith('heel')):
+            continue
+        if name.endswith('_l'):
+            ankle_name = 'ankle_l'
+        elif name.endswith('_r'):
+            ankle_name = 'ankle_r'
+        else:
+            raise ValueError(f'Foot keypoint {name!r} missing _l/_r suffix')
+        if ankle_name not in keypoints_by_name:
+            raise ValueError(f'Cannot anchor {name!r}: missing {ankle_name!r}')
+        pairs.append((int(meta['id']), int(keypoints_by_name[ankle_name]['id'])))
+    if not pairs:
+        raise ValueError('soft_foot_anchor enabled but no toe_/heel* keypoints found')
+    return pairs
+
+
+def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
+    custom = head_cfg.custom
+    kwargs = {
+        'num_heads': custom.num_heads,
+        'num_layers': custom.num_layers,
+        'dropout': custom.dropout,
+        'soft_foot_anchor': custom.soft_foot_anchor,
+        'soft_foot_anchor_init': custom.soft_foot_anchor_init,
+    }
+    if custom.soft_foot_anchor:
+        kwargs['foot_anchor_pairs'] = build_foot_anchor_pairs(head_cfg.keypoints)
+    return kwargs
 
 
 def build_oks_sigmas(oks_sigmas: dict[str, float] | None, keypoints_by_name: dict) -> torch.Tensor:
@@ -715,11 +752,7 @@ def build_model(config, device):
                 case 'simcc':
                     head_kwargs = {}
                     if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
-                        head_kwargs = {
-                            'num_heads': head_cfg.custom.num_heads,
-                            'num_layers': head_cfg.custom.num_layers,
-                            'dropout': head_cfg.custom.dropout,
-                        }
+                        head_kwargs = build_joint_query_head_kwargs(head_cfg)
                     return DinoCC(
                         NUM_JOINTS,
                         IMAGE_SIZE,
@@ -1108,11 +1141,7 @@ def _run_training(args, config, run_dir, run_config_path):
     head_checkpoint_meta = {
         'head_name': head_cfg.name,
         'head_kwargs': (
-            {
-                'num_heads': head_cfg.custom.num_heads,
-                'num_layers': head_cfg.custom.num_layers,
-                'dropout': head_cfg.custom.dropout,
-            }
+            build_joint_query_head_kwargs(head_cfg)
             if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc')
             else {}
         ),
