@@ -9,11 +9,6 @@ import yaml
 IMAGES_DIR = Path('dataset/image_store')
 CVAT_MAPPING_FILE = Path('mapping/cvat_dance_28.yaml')
 
-# Set in main() from --version / positional version.
-DATASET_DIR: Path
-ANNOTATIONS_FILE: Path
-OUTPUT_ANNOTATIONS_FILE: Path
-
 
 def resolve_dataset_dir(annotation_version: str) -> Path:
     """Map 'X.Y.Z' -> dataset/versions/X.X/X.Y.X/X.Y.Z (same layout as train.py)."""
@@ -154,16 +149,16 @@ def load_cvat_label_to_standard_id(mapping_path: Path = CVAT_MAPPING_FILE) -> di
     return label_to_standard
 
 
-def image_for_task_frame(task_id, frame_number):
+def image_for_task_frame(task_id, frame_number, images_dir: Path):
     image_name = f'task_{task_id}_frame_{frame_number:06d}.jpg'
-    image_path = IMAGES_DIR / image_name
+    image_path = images_dir / image_name
     if not image_path.exists():
         raise FileNotFoundError(f'Missing image-store file: {image_path}')
     return image_name
 
 
-def load_project():
-    root = ET.parse(ANNOTATIONS_FILE).getroot()
+def load_project(annotations_file: Path):
+    root = ET.parse(annotations_file).getroot()
     meta = root.find('meta')
     if meta is None:
         raise ValueError('The annotations XML does not contain a meta element.')
@@ -172,9 +167,23 @@ def load_project():
     return root, project, tasks
 
 
-def build_annotations():
-    root, project, tasks = load_project()
-    cvat_label_to_standard_id = load_cvat_label_to_standard_id()
+def build_annotations(
+    annotations_file: Path,
+    output_file: Path,
+    images_dir: Path = IMAGES_DIR,
+    mapping_file: Path = CVAT_MAPPING_FILE,
+):
+    """Build cleaned_annotations.xml from a CVAT project track export."""
+    annotations_file = Path(annotations_file)
+    output_file = Path(output_file)
+    images_dir = Path(images_dir)
+    mapping_file = Path(mapping_file)
+
+    if not annotations_file.is_file():
+        raise FileNotFoundError(f'Missing annotations XML: {annotations_file}')
+
+    root, project, tasks = load_project(annotations_file)
+    cvat_label_to_standard_id = load_cvat_label_to_standard_id(mapping_file)
     require_role = project_defines_role(project)
     # CVAT project exports use global frame indices across tasks in id order.
     # Do not use min(track frame): a task can start before its first annotation.
@@ -297,7 +306,7 @@ def build_annotations():
 
             filtered_track.append(copy.deepcopy(shape))
             has_selected_shape = True
-            image_name = image_for_task_frame(task_id, relative_frame)
+            image_name = image_for_task_frame(task_id, relative_frame, images_dir)
             selected_images.add((task_id, relative_frame, image_name))
             selected_shapes.append((task_id, relative_frame, track, shape, bbox_shape))
         if has_selected_shape:
@@ -311,6 +320,7 @@ def build_annotations():
     for task_id, frame, track, shape, bbox_shape in selected_shapes:
         frames_by_task.setdefault(task_id, {}).setdefault(frame, []).append((track, shape, bbox_shape))
 
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     for task_id, frames in frames_by_task.items():
         video_element = ET.SubElement(videos_element, 'video', id=task_id, name=tasks[task_id].findtext('name', ''))
         for frame_number, people in sorted(frames.items()):
@@ -318,7 +328,7 @@ def build_annotations():
                 video_element,
                 'frame',
                 number=str(frame_number),
-                image=os.path.relpath(IMAGES_DIR / image_by_frame[(task_id, frame_number)], OUTPUT_ANNOTATIONS_FILE.parent),
+                image=os.path.relpath(images_dir / image_by_frame[(task_id, frame_number)], output_file.parent),
             )
             for track, shape, bbox_shape in people:
                 person_attrs = {
@@ -359,7 +369,7 @@ def build_annotations():
 
     output_tree = ET.ElementTree(output_root)
     ET.indent(output_tree, space='  ')
-    output_tree.write(OUTPUT_ANNOTATIONS_FILE, encoding='utf-8', xml_declaration=True)
+    output_tree.write(output_file, encoding='utf-8', xml_declaration=True)
     return (
         len(selected_images),
         len(selected_tracks),
@@ -369,8 +379,6 @@ def build_annotations():
 
 
 def main():
-    global DATASET_DIR, ANNOTATIONS_FILE, OUTPUT_ANNOTATIONS_FILE, IMAGES_DIR, CVAT_MAPPING_FILE
-
     parser = argparse.ArgumentParser(
         description='Build cleaned_annotations.xml for a dataset annotation version.'
     )
@@ -392,23 +400,23 @@ def main():
     )
     args = parser.parse_args()
 
-    DATASET_DIR = resolve_dataset_dir(args.version)
-    ANNOTATIONS_FILE = DATASET_DIR / 'annotations.xml'
-    OUTPUT_ANNOTATIONS_FILE = DATASET_DIR / 'cleaned_annotations.xml'
-    IMAGES_DIR = args.images
-    CVAT_MAPPING_FILE = args.mapping
+    dataset_dir = resolve_dataset_dir(args.version)
+    annotations_file = dataset_dir / 'annotations.xml'
+    output_file = dataset_dir / 'cleaned_annotations.xml'
 
-    if not ANNOTATIONS_FILE.is_file():
-        raise FileNotFoundError(f'Missing annotations XML: {ANNOTATIONS_FILE}')
-
-    print(f'Dataset dir: {DATASET_DIR}')
-    image_count, track_count, via_completion, via_frame_cleaned = build_annotations()
+    print(f'Dataset dir: {dataset_dir}')
+    image_count, track_count, via_completion, via_frame_cleaned = build_annotations(
+        annotations_file=annotations_file,
+        output_file=output_file,
+        images_dir=args.images,
+        mapping_file=args.mapping,
+    )
     print(f'Created {image_count} unique images.')
     print(f'Created {track_count} cleaned tracks.')
     print(f'Selected shapes via cleaned_completion grid: {via_completion}')
     print(f'Selected shapes via frame_cleaned: {via_frame_cleaned}')
-    print(f'Output: {OUTPUT_ANNOTATIONS_FILE}')
-    print(f'Keypoint ids written as standard_id via {CVAT_MAPPING_FILE}')
+    print(f'Output: {output_file}')
+    print(f'Keypoint ids written as standard_id via {args.mapping}')
 
 
 if __name__ == '__main__':

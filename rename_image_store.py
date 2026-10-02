@@ -70,6 +70,59 @@ def build_mapping(images_dir, tasks):
     return mapping
 
 
+def rename_image_store(images, annotations, output=None, apply=False):
+    """Map CVAT collision-suffixed frames to task/frame names.
+
+    Returns the (source_path, output_name) mapping. When apply is True, also
+    writes JPEGs into output (default: <images>/named).
+    """
+    images = Path(images)
+    annotations = Path(annotations)
+    if not images.is_dir():
+        raise NotADirectoryError(images)
+    if not annotations.is_file():
+        raise FileNotFoundError(annotations)
+
+    output_dir = Path(output) if output is not None else images / "named"
+    tasks = load_tasks(annotations)
+    mapping = build_mapping(images, tasks)
+
+    print(f"Tasks: {len(tasks)}")
+    print(f"Images: {len(mapping)}")
+    print(f"Output: {output_dir}")
+    if not apply:
+        print("Dry run only. Pass apply=True to write JPEG files.")
+        for source_path, output_name in mapping[:20]:
+            print(f"{source_path.name} -> {output_name}")
+        if len(mapping) > 20:
+            print(f"... {len(mapping) - 20} more mappings")
+        return mapping
+
+    missing_sources = [
+        source_path
+        for source_path, _ in mapping
+        if not source_path.exists()
+    ]
+    if missing_sources:
+        examples = "\n".join(str(path) for path in missing_sources[:10])
+        raise FileNotFoundError(
+            f"{len(missing_sources)} source images are missing. Examples:\n{examples}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for source_path, output_name in mapping:
+        destination = output_dir / output_name
+        if destination.exists():
+            raise FileExistsError(f"Refusing to overwrite {destination}")
+        with Image.open(source_path) as image:
+            image.convert("RGB").save(destination, format="JPEG", quality=95)
+        written += 1
+
+    print(f"Wrote {written} JPEG files.")
+    return mapping
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert CVAT collision-suffixed images to task/frame names."
@@ -97,49 +150,12 @@ def main():
         help="Write files. Without this flag, only print the planned mapping.",
     )
     args = parser.parse_args()
-
-    if not args.images.is_dir():
-        raise NotADirectoryError(args.images)
-    if not args.annotations.is_file():
-        raise FileNotFoundError(args.annotations)
-
-    output_dir = args.output or args.images / "named"
-    tasks = load_tasks(args.annotations)
-    mapping = build_mapping(args.images, tasks)
-
-    print(f"Tasks: {len(tasks)}")
-    print(f"Images: {len(mapping)}")
-    print(f"Output: {output_dir}")
-    if not args.apply:
-        print("Dry run only. Add --apply to write PNG files.")
-        for source_path, output_name in mapping[:20]:
-            print(f"{source_path.name} -> {output_name}")
-        if len(mapping) > 20:
-            print(f"... {len(mapping) - 20} more mappings")
-        return
-
-    missing_sources = [
-        source_path
-        for source_path, _ in mapping
-        if not source_path.exists()
-    ]
-    if missing_sources:
-        examples = "\n".join(str(path) for path in missing_sources[:10])
-        raise FileNotFoundError(
-            f"{len(missing_sources)} source images are missing. Examples:\n{examples}"
-        )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
-    for source_path, output_name in mapping:
-        destination = output_dir / output_name
-        if destination.exists():
-            raise FileExistsError(f"Refusing to overwrite {destination}")
-        with Image.open(source_path) as image:
-            image.convert("RGB").save(destination, format="JPEG", quality=95)
-        written += 1
-
-    print(f"Wrote {written} PNG files.")
+    rename_image_store(
+        images=args.images,
+        annotations=args.annotations,
+        output=args.output,
+        apply=args.apply,
+    )
 
 
 if __name__ == "__main__":
