@@ -1,90 +1,75 @@
-name: dance_28
-num_keypoints: 28
+name: dance_23
+num_keypoints: 23
 keypoints:
-  glabella:
-    id: 0
-    standard_id: 17
-  ear_l:
-    id: 1
-    standard_id: 3
-  ear_r:
-    id: 2
-    standard_id: 4
-  eop:
-    id: 3
-    standard_id: 18
-  notch:
-    id: 4
-    standard_id: 19
   wrist_l:
-    id: 5
+    id: 0
     standard_id: 9
   shoulder_l:
-    id: 6
+    id: 1
     standard_id: 5
   elbow_l:
-    id: 7
+    id: 2
     standard_id: 7
   wrist_r:
-    id: 8
+    id: 3
     standard_id: 10
   shoulder_r:
-    id: 9
+    id: 4
     standard_id: 6
   elbow_r:
-    id: 10
+    id: 5
     standard_id: 8
-  asis_l:
-    id: 11
-    standard_id: 20
-  asis_r:
-    id: 12
-    standard_id: 21
-  sacrum:
-    id: 13
-    standard_id: 22
   hip_l:
-    id: 14
+    id: 6
     standard_id: 11
   knee_l:
-    id: 15
+    id: 7
     standard_id: 13
   ankle_l:
-    id: 16
+    id: 8
     standard_id: 15
   hip_r:
-    id: 17
+    id: 9
     standard_id: 12
   knee_r:
-    id: 18
+    id: 10
     standard_id: 14
   ankle_r:
-    id: 19
+    id: 11
     standard_id: 16
   toe_b_l:
-    id: 20
+    id: 12
     standard_id: 23
   toe_s_l:
-    id: 21
+    id: 13
     standard_id: 24
   heel_l:
-    id: 22
+    id: 14
     standard_id: 25
   heel_spike_l:
-    id: 23
+    id: 15
     standard_id: 26
   toe_b_r:
-    id: 24
+    id: 16
     standard_id: 27
   toe_s_r:
-    id: 25
+    id: 17
     standard_id: 28
   heel_r:
-    id: 26
+    id: 18
     standard_id: 29
   heel_spike_r:
-    id: 27
+    id: 19
     standard_id: 30
+  ear_l:
+    id: 20
+    standard_id: 3
+  ear_r:
+    id: 21
+    standard_id: 4
+  glabella:
+    id: 22
+    standard_id: 17
 left_right_pairs:
   - [wrist_l, wrist_r]
   - [shoulder_l, shoulder_r]
@@ -97,4 +82,29 @@ left_right_pairs:
   - [heel_l, heel_r]
   - [heel_spike_l, heel_spike_r]
   - [ear_l, ear_r]
-  - [asis_l, asis_r]
+# COCO-style OKS sigmas (fraction of person scale). Foot tips use ankle-like values.
+oks_sigmas:
+  shoulder_l: 0.079
+  shoulder_r: 0.079
+  elbow_l: 0.072
+  elbow_r: 0.072
+  wrist_l: 0.062
+  wrist_r: 0.062
+  hip_l: 0.107
+  hip_r: 0.107
+  knee_l: 0.087
+  knee_r: 0.087
+  ankle_l: 0.089
+  ankle_r: 0.089
+  toe_b_l: 0.089
+  toe_b_r: 0.089
+  toe_s_l: 0.089
+  toe_s_r: 0.089
+  heel_l: 0.089
+  heel_r: 0.089
+  heel_spike_l: 0.089
+  heel_spike_r: 0.089
+  ear_l: 0.035
+  ear_r: 0.035
+  glabella: 0.026
+  
