@@ -182,7 +182,7 @@ def check_annotation_images(annotation_file: Path, results: CheckResult):
     oob = 0
     nonfinite = 0
     visible = 0
-    for image_path, keypoints, _bbox in dataset.samples:
+    for image_path, keypoints, _bbox, _role in dataset.samples:
         try:
             with Image.open(image_path) as image:
                 width, height = image.size
@@ -223,8 +223,8 @@ def check_crop_geometry(dataset: KeypointDataset, results: CheckResult, n: int =
     )
     max_err = 0.0
     for index in indices:
-        image_path, keypoints, bbox = dataset.samples[index]
-        pixels, out_keypoints = eval_dataset[index]
+        image_path, keypoints, bbox, _role = dataset.samples[index]
+        pixels, out_keypoints, _role_bits = eval_dataset[index]
         with Image.open(image_path) as image:
             width, height = image.size
         crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(bbox, width, height)
@@ -445,7 +445,7 @@ def run_checks(config) -> tuple[CheckResult, KeypointDataset | None, set | None]
 def select_gallery_indices(samples, num_samples: int, seed: int) -> list[int]:
     rng = random.Random(seed)
     by_image: dict = {}
-    for index, (image_path, _kp, bbox) in enumerate(samples):
+    for index, (image_path, _kp, bbox, _role) in enumerate(samples):
         by_image.setdefault(image_path, []).append((index, bbox))
 
     multi = [indices for indices in by_image.values() if len(indices) > 1]
@@ -453,7 +453,7 @@ def select_gallery_indices(samples, num_samples: int, seed: int) -> list[int]:
     rng.shuffle(multi_indices)
 
     border = []
-    for index, (image_path, _kp, bbox) in enumerate(samples):
+    for index, (image_path, _kp, bbox, _role) in enumerate(samples):
         try:
             with Image.open(image_path) as image:
                 width, height = image.size
@@ -502,7 +502,7 @@ def write_gallery(dataset: KeypointDataset, config, out_dir: Path, num_samples: 
     eval_dataset = KeypointDataset(Path('.'), set(), training=False, samples=dataset.samples)
 
     for rank, sample_index in enumerate(indices):
-        image_path, keypoints, bbox = dataset.samples[sample_index]
+        image_path, keypoints, bbox, _role = dataset.samples[sample_index]
         stem = f'{rank:03d}_{image_path.stem}_p{sample_index}'
 
         # Raw annotation-space overlay
@@ -515,7 +515,7 @@ def write_gallery(dataset: KeypointDataset, config, out_dir: Path, num_samples: 
         raw.save(raw_dir / f'{stem}.jpg', quality=92)
 
         # Training crop (no aug)
-        pixels, crop_keypoints = eval_dataset[sample_index]
+        pixels, crop_keypoints, _role_bits = eval_dataset[sample_index]
         crop_image = denormalize_pixels(pixels)
         draw_keypoints(crop_image, crop_keypoints.numpy(), names, color='lime')
         crop_image.save(crop_dir / f'{stem}.jpg', quality=92)

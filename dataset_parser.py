@@ -56,6 +56,41 @@ def track_attribute_value(track, name):
     return None
 
 
+VALID_ROLES = frozenset({'lead', 'follow'})
+
+
+def project_defines_role(project) -> bool:
+    """True if bbox or skeleton label schema includes a role attribute."""
+    for label in project.findall('./labels/label'):
+        for attribute in label.findall('./attributes/attribute'):
+            if attribute.findtext('name') == 'role':
+                return True
+    return False
+
+
+def resolve_track_role(skeleton_track, bbox_track) -> str:
+    """Track-constant role from skeleton (preferred); warn if bbox disagrees."""
+    skeleton_role = track_attribute_value(skeleton_track, 'role')
+    bbox_role = track_attribute_value(bbox_track, 'role') if bbox_track is not None else None
+    if skeleton_role is None:
+        raise ValueError(
+            f'Skeleton track {skeleton_track.get("id")} is missing required role. '
+            f'Set role to one of {sorted(VALID_ROLES)} in CVAT.'
+        )
+    role = skeleton_role.lower()
+    if role not in VALID_ROLES:
+        raise ValueError(
+            f'Skeleton track {skeleton_track.get("id")} has invalid role '
+            f'{skeleton_role!r}; expected one of {sorted(VALID_ROLES)}.'
+        )
+    if bbox_role is not None and bbox_role.lower() != role:
+        print(
+            f'Warning: role mismatch on skeleton track {skeleton_track.get("id")}: '
+            f'skeleton={role!r} bbox={bbox_role.lower()!r}; using skeleton.'
+        )
+    return role
+
+
 def track_has_selectable_shapes(track):
     return any(
         attribute_is_true(shape, 'cleaned') or attribute_is_true(shape, 'frame_cleaned')
@@ -64,7 +99,7 @@ def track_has_selectable_shapes(track):
     )
 
 
-def shape_should_include(shape, start_frame, track_id):
+def shape_should_include(shape, start_frame, track_id, task_id=None):
     """Include a skeleton frame if it is on the cleaned_completion grid or manually marked.
 
     - Track/shape `cleaned` + `cleaned_completion`: keep every Nth relative frame.
@@ -76,11 +111,25 @@ def shape_should_include(shape, start_frame, track_id):
     if not attribute_is_true(shape, 'cleaned'):
         return False
 
-    completion = int(attribute_value(shape, 'cleaned_completion') or '0')
-    if completion <= 0:
-        raise ValueError(f'Invalid cleaned_completion on track {track_id}.')
+    raw_completion = attribute_value(shape, 'cleaned_completion')
+    try:
+        completion = int(raw_completion) if raw_completion is not None else 0
+    except ValueError:
+        completion = None
     frame = int(shape.get('frame'))
     relative_frame = frame - start_frame
+    task_bit = f' in task {task_id}' if task_id is not None else ''
+    if completion is None or completion <= 0:
+        shown = 'missing' if raw_completion is None else repr(raw_completion)
+        raise ValueError(
+            f'Skeleton track {track_id}{task_bit} is marked cleaned=true at '
+            f'global frame {frame} (task-local frame {relative_frame}), but '
+            f'cleaned_completion is {shown}. '
+            f'When cleaned=true, cleaned_completion must be a positive integer N '
+            f'(keep every Nth frame, e.g. 1 = every frame). '
+            f'Either set cleaned_completion to N in CVAT, or set cleaned=false and '
+            f'mark individual frames with frame_cleaned=true instead.'
+        )
     return relative_frame % completion == 0
 
 
@@ -126,16 +175,14 @@ def load_project():
 def build_annotations():
     root, project, tasks = load_project()
     cvat_label_to_standard_id = load_cvat_label_to_standard_id()
-    task_start_frames = {
-        task_id: min(
-            int(shape.get('frame'))
-            for track in root.findall('track')
-            if track.get('task_id') == task_id
-            for shape in track
-        )
-        for task_id in tasks
-        if any(track.get('task_id') == task_id for track in root.findall('track'))
-    }
+    require_role = project_defines_role(project)
+    # CVAT project exports use global frame indices across tasks in id order.
+    # Do not use min(track frame): a task can start before its first annotation.
+    task_start_frames = {}
+    global_offset = 0
+    for task_id in sorted(tasks, key=lambda value: int(value)):
+        task_start_frames[task_id] = global_offset
+        global_offset += int(tasks[task_id].findtext('size') or 0)
 
     bbox_tracks_by_task = {}
     skeleton_tracks_by_task = {}
@@ -146,29 +193,66 @@ def build_annotations():
         elif track.get('label') == 'skeleton' and track_has_selectable_shapes(track):
             skeleton_tracks_by_task.setdefault(task_id, []).append(track)
 
+    def track_frame_set(track):
+        return {
+            int(shape.get('frame'))
+            for shape in track
+            if shape.tag not in ('attribute',) and shape.get('frame') is not None
+        }
+
     bbox_for_skeleton = {}
     for task_id, skeleton_tracks in skeleton_tracks_by_task.items():
-        bbox_by_person = {}
+        bboxes_by_person = {}
         for bbox_track in bbox_tracks_by_task.get(task_id, []):
             person_id = track_attribute_value(bbox_track, 'person_id')
             if person_id is None:
-                raise ValueError(f'BBox track {bbox_track.get("id")} is missing person_id.')
-            key = (task_id, person_id)
-            if key in bbox_by_person:
-                raise ValueError(f'Duplicate bbox person_id {person_id} in task {task_id}.')
-            bbox_by_person[key] = bbox_track
+                raise ValueError(
+                    f'BBox track {bbox_track.get("id")} in task {task_id} is missing '
+                    f'person_id. Set person_id on the bbox track in CVAT.'
+                )
+            bboxes_by_person.setdefault(person_id, []).append(bbox_track)
+
+        for person_id, bbox_tracks in bboxes_by_person.items():
+            for index, bbox_track in enumerate(bbox_tracks):
+                frames = track_frame_set(bbox_track)
+                for other in bbox_tracks[index + 1:]:
+                    overlap = frames & track_frame_set(other)
+                    if overlap:
+                        raise ValueError(
+                            f'Task {task_id} has overlapping bbox tracks for person_id '
+                            f'{person_id} (tracks {bbox_track.get("id")} and '
+                            f'{other.get("id")}), e.g. at global frame {min(overlap)}. '
+                            f'Each person_id may only have one bbox track per frame.'
+                        )
+
         for skeleton_track in skeleton_tracks:
             person_id = track_attribute_value(skeleton_track, 'person_id')
-            bbox_track = bbox_by_person.get((task_id, person_id))
-            if person_id is None or bbox_track is None:
-                raise ValueError(f'No matching bbox for person_id {person_id} in task {task_id}.')
-            bbox_for_skeleton[skeleton_track.get('id')] = bbox_track
+            if person_id is None:
+                raise ValueError(
+                    f'Skeleton track {skeleton_track.get("id")} in task {task_id} is '
+                    f'missing person_id. Set person_id so it can be matched to a bbox.'
+                )
+            skeleton_frames = track_frame_set(skeleton_track)
+            matches = [
+                bbox_track
+                for bbox_track in bboxes_by_person.get(person_id, [])
+                if track_frame_set(bbox_track) & skeleton_frames
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f'Skeleton track {skeleton_track.get("id")} in task {task_id} '
+                    f'(person_id={person_id}) matched {len(matches)} bbox tracks; '
+                    f'expected exactly 1 with overlapping frames. '
+                    f'Check that a bbox with the same person_id covers this skeleton.'
+                )
+            bbox_for_skeleton[skeleton_track.get('id')] = matches[0]
 
     selected_images = set()
     selected_shapes = []
     selected_tracks = []
     selected_via_completion = 0
     selected_via_frame_cleaned = 0
+    role_by_track = {}
     for track in root.findall('track'):
         if track.get('label') != 'skeleton' or track.get('task_id') not in tasks:
             continue
@@ -182,7 +266,9 @@ def build_annotations():
         for shape in track:
             if shape.tag in ('attribute',):
                 continue
-            if not shape_should_include(shape, start_frame, track.get('id')):
+            if not shape_should_include(
+                shape, start_frame, track.get('id'), task_id=task_id
+            ):
                 continue
 
             frame = int(shape.get('frame'))
@@ -190,7 +276,19 @@ def build_annotations():
             bbox_track = bbox_for_skeleton[track.get('id')]
             bbox_shape = next((candidate for candidate in bbox_track if candidate.get('frame') == str(frame)), None)
             if bbox_shape is None:
-                raise ValueError(f'Missing bbox for skeleton track {track.get("id")} at frame {frame}.')
+                # BBox tracks can have gaps (e.g. after outside=1) even when the skeleton
+                # was marked frame_cleaned; skip rather than fail the whole build.
+                print(
+                    f'Warning: missing bbox for skeleton track {track.get("id")} '
+                    f'at frame {frame}; skipping.'
+                )
+                continue
+            if bbox_shape.get('outside') == '1':
+                print(
+                    f'Warning: outside bbox for skeleton track {track.get("id")} '
+                    f'at frame {frame}; skipping.'
+                )
+                continue
 
             if attribute_is_true(shape, 'frame_cleaned'):
                 selected_via_frame_cleaned += 1
@@ -223,7 +321,22 @@ def build_annotations():
                 image=os.path.relpath(IMAGES_DIR / image_by_frame[(task_id, frame_number)], OUTPUT_ANNOTATIONS_FILE.parent),
             )
             for track, shape, bbox_shape in people:
-                person = ET.SubElement(frame_element, 'person', track_id=track.get('id', ''), person_id=track_attribute_value(track, 'person_id'))
+                person_attrs = {
+                    'track_id': track.get('id', ''),
+                    'person_id': track_attribute_value(track, 'person_id') or '',
+                }
+                track_id = track.get('id')
+                if require_role:
+                    if track_id not in role_by_track:
+                        role_by_track[track_id] = resolve_track_role(
+                            track, bbox_for_skeleton.get(track_id)
+                        )
+                    person_attrs['role'] = role_by_track[track_id]
+                else:
+                    role = track_attribute_value(track, 'role')
+                    if role is not None:
+                        person_attrs['role'] = role.lower()
+                person = ET.SubElement(frame_element, 'person', **person_attrs)
                 ET.SubElement(person, 'bbox', x1=bbox_shape.get('xtl', ''), y1=bbox_shape.get('ytl', ''), x2=bbox_shape.get('xbr', ''), y2=bbox_shape.get('ybr', ''))
                 for point in shape.findall('points'):
                     cvat_label = int(point.get('label'))

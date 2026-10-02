@@ -34,16 +34,67 @@ class BaseSimCCHead(nn.Module, ABC):
 
   @abstractmethod
   def forward(
-      self, patch_tokens: torch.Tensor
+      self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Args:
 
         patch_tokens: [B, N, C]
+        role: optional [B, 2] lead/follow bits (is_lead, is_follow)
 
     Returns:
         (pred_x, pred_y): ([B, K, W_bins], [B, K, H_bins])
     """
     pass
+
+
+ROLE_DIM = 2
+
+
+class RoleConditioner(nn.Module):
+  """Map lead/follow bits to a query bias and optional FiLM (gamma, beta) on features."""
+
+  def __init__(self, dim: int, use_film: bool = True):
+    super().__init__()
+    self.use_film = use_film
+    self.query_embed = nn.Linear(ROLE_DIM, dim, bias=False)
+    # Small nonzero query bias so roles differ immediately.
+    nn.init.normal_(self.query_embed.weight, std=0.02)
+    if use_film:
+      self.film = nn.Linear(ROLE_DIM, 2 * dim)
+      # FiLM starts as identity (gamma=0, beta=0).
+      nn.init.zeros_(self.film.weight)
+      nn.init.zeros_(self.film.bias)
+    else:
+      self.film = None
+
+  def bias_queries(self, queries: torch.Tensor, role: torch.Tensor) -> torch.Tensor:
+    # queries: [B, K, D], role: [B, 2]
+    return queries + self.query_embed(role).unsqueeze(1)
+
+  def film_features(self, features: torch.Tensor, role: torch.Tensor) -> torch.Tensor:
+    if self.film is None:
+      return features
+    # features: [B, N, D] or [B, D, H, W]; role: [B, 2]
+    gamma, beta = self.film(role).chunk(2, dim=-1)
+    if features.dim() == 4:
+      # Conv feature map [B, D, H, W]
+      gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+      beta = beta.unsqueeze(-1).unsqueeze(-1)
+    else:
+      gamma = gamma.unsqueeze(1)
+      beta = beta.unsqueeze(1)
+    return features * (1.0 + gamma) + beta
+
+  def resolve_role(
+      self, role: torch.Tensor | None, batch_size: int, device, dtype
+  ) -> torch.Tensor:
+    if role is None:
+      return torch.zeros(batch_size, ROLE_DIM, device=device, dtype=dtype)
+    if role.shape != (batch_size, ROLE_DIM):
+      raise ValueError(
+          f'Expected role shape ({batch_size}, {ROLE_DIM}), got {tuple(role.shape)}'
+      )
+    return role.to(device=device, dtype=dtype)
 
 
 class DepthwiseSimCCHead(BaseSimCCHead):
@@ -57,11 +108,15 @@ class DepthwiseSimCCHead(BaseSimCCHead):
       out_size: IVec2,
       split_ratio: float = 2.0,
       neck_dim: int = 256,
+      use_role: bool = False,
+      role_film: bool = True,
       **kwargs,
   ):
     super().__init__()
     self.grid_size = grid_size
     self.neck_dim = neck_dim
+    self.use_role = use_role
+    self.role_film = role_film
     self.out_bins_size = IVec2(
         int(out_size.x * split_ratio), int(out_size.y * split_ratio)
     )
@@ -96,13 +151,20 @@ class DepthwiseSimCCHead(BaseSimCCHead):
         nn.Linear(self.grid_size.y, self.out_bins_size.y),
     )
     self.fc_y = nn.Linear(neck_dim, num_joints)
+    # Depthwise has no joint queries; role conditioning is FiLM-only.
+    self.role_conditioner = (
+        RoleConditioner(neck_dim, use_film=True) if use_role and role_film else None
+    )
 
-  def forward(self, patch_tokens: torch.Tensor):
+  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
     B, _, C = patch_tokens.shape
     x_2d = patch_tokens.permute(0, 2, 1).reshape(
         B, C, self.grid_size.y, self.grid_size.x
     )
     feat = self.neck(x_2d)
+    if self.role_conditioner is not None:
+      role = self.role_conditioner.resolve_role(role, B, feat.device, feat.dtype)
+      feat = self.role_conditioner.film_features(feat, role)
 
     # Note: transpose(1, 2) is cleaner than permute(0, 2, 1)
     feat_x = self.mlp_x(feat).transpose(1, 2)
@@ -213,6 +275,8 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       soft_foot_anchor: bool = False,
       soft_foot_anchor_init: float = 0.4,
       foot_anchor_pairs: list[tuple[int, int]] | None = None,
+      use_role: bool = False,
+      role_film: bool = True,
       **kwargs,
   ):
     super().__init__()
@@ -227,6 +291,8 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.neck_dim = neck_dim
     self.num_joints = num_joints
     self.soft_foot_anchor = soft_foot_anchor
+    self.use_role = use_role
+    self.role_film = role_film
     self.out_bins_size = IVec2(
         int(out_size.x * split_ratio), int(out_size.y * split_ratio)
     )
@@ -241,6 +307,9 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     )
     self.fc_x = nn.Linear(neck_dim, self.out_bins_size.x)
     self.fc_y = nn.Linear(neck_dim, self.out_bins_size.y)
+    self.role_conditioner = (
+        RoleConditioner(neck_dim, use_film=role_film) if use_role else None
+    )
 
     if soft_foot_anchor:
       if not foot_anchor_pairs:
@@ -283,7 +352,7 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     queries[:, self.foot_anchor_foot_ids] = foot + gate * self.ankle_to_foot(ankle)
     return queries
 
-  def forward(self, patch_tokens: torch.Tensor):
+  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
     B, N, _ = patch_tokens.shape
     expected_n = self.grid_size.x * self.grid_size.y
     if N != expected_n:
@@ -293,6 +362,11 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
 
     memory = self.input_proj(patch_tokens) + self.patch_pos_embed
     queries = self._build_queries(B)
+    if self.role_conditioner is not None:
+      role = self.role_conditioner.resolve_role(role, B, memory.device, memory.dtype)
+      queries = self.role_conditioner.bias_queries(queries, role)
+      if self.role_conditioner.use_film:
+        memory = self.role_conditioner.film_features(memory, role)
     for layer in self.layers:
       queries = layer(queries, memory)
 
@@ -374,7 +448,7 @@ class DinoCC(nn.Module):
         return checkpoint
 
 
-    def forward(self, pixel_values):
+    def forward(self, pixel_values, role=None):
         # DINOv2 needs pos-encoding interpolation for non-native resolutions; DINOv3 uses RoPE
         if getattr(self.backbone.config, 'model_type', None) == 'dinov2':
             outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
@@ -386,7 +460,7 @@ class DinoCC(nn.Module):
         patch_tokens = outputs.last_hidden_state[:, patch_start:, :]  # [B, N, C]
 
         # Predict 1D coordinates
-        pred_x, pred_y = self.head(patch_tokens)
+        pred_x, pred_y = self.head(patch_tokens, role=role)
         return pred_x, pred_y
 
 

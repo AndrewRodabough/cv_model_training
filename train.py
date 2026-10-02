@@ -2,6 +2,7 @@ import argparse
 import csv
 import random
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -111,6 +112,9 @@ class SimCCConfig:
     y_bins: int
     gaussian_sigma: float
     pooling: str
+    use_role: bool = False
+    role_dropout: float = 0.1
+    role_film: bool = True
 
 @dataclass
 class JointQuerySimCCConfig:
@@ -124,6 +128,10 @@ class JointQuerySimCCConfig:
     # Soft-anchor foot queries to same-side ankle: q_foot += σ(α) * W(q_ankle)
     soft_foot_anchor: bool = False
     soft_foot_anchor_init: float = 0.4
+    use_role: bool = False
+    role_dropout: float = 0.1
+    # If false: query bias only (no FiLM on patch memory)
+    role_film: bool = True
 
 @dataclass
 class TrainingConfig:
@@ -175,9 +183,9 @@ AUG_SCALE_MAX = 1.25
 AUG_SHIFT_FRAC = 0.1
 AUG_ROTATION_DEG = 12.0
 AUG_COLOR_JITTER = 0.25
-
-
-
+USE_ROLE = False
+ROLE_DROPOUT = 0.1
+ROLE_DIM = 2
 
 
 def set_seed(seed):
@@ -187,6 +195,20 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def encode_role(role: str | None) -> torch.Tensor:
+    """Encode track role as [is_lead, is_follow] bits. Unknown → [0, 0]."""
+    bits = torch.zeros(ROLE_DIM, dtype=torch.float32)
+    if role is None:
+        return bits
+    normalized = role.strip().lower()
+    if normalized == 'lead':
+        bits[0] = 1.0
+    elif normalized == 'follow':
+        bits[1] = 1.0
+    elif normalized:
+        raise ValueError(f'Unknown role {role!r}; expected lead, follow, or empty')
+    return bits
 
 
 def parse_person(person):
@@ -203,7 +225,8 @@ def parse_person(person):
         bbox = tuple(float(bbox_element.get(name)) for name in ('x1', 'y1', 'x2', 'y2'))
     else:
         bbox = tuple(float(person.get(name)) for name in ('bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2'))
-    return keypoints, bbox
+    role = person.get('role')
+    return keypoints, bbox, role
 
 
 def horizontally_flip_keypoints(keypoints):
@@ -256,8 +279,13 @@ class KeypointDataset(Dataset):
                 for frame in video.findall('frame'):
                     image_path = self.image_root / frame.get('image')
                     for person in frame.findall('person'):
-                        keypoints, bbox = parse_person(person)
-                        samples.append((image_path, keypoints, bbox))
+                        keypoints, bbox, role = parse_person(person)
+                        if USE_ROLE and role is None:
+                            raise ValueError(
+                                f'Missing role on person in {image_path} '
+                                f'(track_id={person.get("track_id")})'
+                            )
+                        samples.append((image_path, keypoints, bbox, role))
 
         self.samples = list(samples)
 
@@ -268,7 +296,7 @@ class KeypointDataset(Dataset):
         return len(self.samples) * self.repeats
 
     def __getitem__(self, index):
-        image_path, keypoints, bbox = self.samples[index % len(self.samples)]
+        image_path, keypoints, bbox, role = self.samples[index % len(self.samples)]
         image = Image.open(image_path).convert('RGB')
         original_width, original_height = image.size
 
@@ -311,7 +339,8 @@ class KeypointDataset(Dataset):
 
         pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255.0
         pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
-        return pixels, torch.from_numpy(keypoints)
+        role_bits = encode_role(role)
+        return pixels, torch.from_numpy(keypoints), role_bits
 
 
 def make_loader(dataset, batch_size, workers):
@@ -377,10 +406,19 @@ def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
         'dropout': custom.dropout,
         'soft_foot_anchor': custom.soft_foot_anchor,
         'soft_foot_anchor_init': custom.soft_foot_anchor_init,
+        'use_role': custom.use_role,
+        'role_film': custom.role_film,
     }
     if custom.soft_foot_anchor:
         kwargs['foot_anchor_pairs'] = build_foot_anchor_pairs(head_cfg.keypoints)
     return kwargs
+
+
+def build_depthwise_head_kwargs(head_cfg: HeadConfig) -> dict:
+    return {
+        'use_role': head_cfg.custom.use_role,
+        'role_film': head_cfg.custom.role_film,
+    }
 
 
 def build_oks_sigmas(oks_sigmas: dict[str, float] | None, keypoints_by_name: dict) -> torch.Tensor:
@@ -402,6 +440,7 @@ def setup_from_config(config):
     global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
     global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS, OKS_SIGMAS
     global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
+    global USE_ROLE, ROLE_DROPOUT
 
     image_cfg: ImageConfig = config['image']
     head_cfg: HeadConfig = config['head']
@@ -439,6 +478,11 @@ def setup_from_config(config):
         raise ValueError(f'aug_rotation_deg must be >= 0, got {AUG_ROTATION_DEG}')
     if AUG_COLOR_JITTER < 0 or AUG_COLOR_JITTER >= 1:
         raise ValueError(f'aug_color_jitter must be in [0, 1), got {AUG_COLOR_JITTER}')
+
+    USE_ROLE = bool(getattr(head_cfg.custom, 'use_role', False))
+    ROLE_DROPOUT = float(getattr(head_cfg.custom, 'role_dropout', 0.1))
+    if not 0.0 <= ROLE_DROPOUT <= 1.0:
+        raise ValueError(f'role_dropout must be in [0, 1], got {ROLE_DROPOUT}')
 
     ordered = sorted(head_cfg.keypoints.items(), key=lambda item: item[1]['id'])
     local_ids = [meta['id'] for _, meta in ordered]
@@ -614,19 +658,29 @@ def make_targets(keypoints, device):
     )
 
 
+def maybe_drop_role(role: torch.Tensor, training: bool) -> torch.Tensor:
+    """Randomly zero role bits during training (role dropout)."""
+    if not training or not USE_ROLE or ROLE_DROPOUT <= 0:
+        return role
+    keep = torch.rand(role.shape[0], 1, device=role.device) >= ROLE_DROPOUT
+    return role * keep.to(role.dtype)
+
+
 def run_epoch(model, loader, criterion, optimizer, device, scaler, training, gradient_clip_norm):
     model.train(training)
     total_loss = 0.0
 
-    for pixels, keypoints in loader:
+    for pixels, keypoints, role in loader:
         pixels = pixels.to(device, non_blocking=True)
+        role = role.to(device, non_blocking=True)
+        role = maybe_drop_role(role, training)
         target_x, target_y, weights = make_targets(keypoints, device)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels)
+            pred_x, pred_y = model(pixels, role=role if USE_ROLE else None)
             loss = criterion(pred_x, pred_y, target_x, target_y, weights)
 
         if training:
@@ -670,7 +724,7 @@ def load_keypoint_format(format_name) -> keypoint_mapping:
 def get_annotation_file_path(annotation_version: str) -> Path:
     # Parse version parts (e.g., '1.2.0' -> major='1', minor='2', patch='0')
     parts = annotation_version.split(".")
-    if len(parts) != 3:
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
         raise ValueError(
             f"Expected semantic version format 'X.Y.Z', got: {annotation_version}"
         )
@@ -679,18 +733,37 @@ def get_annotation_file_path(annotation_version: str) -> Path:
     major_dir = f"{major}.X"
     minor_dir = f"{major}.{minor}.X"
 
-    annotation_file = (
-        Path("dataset")
-        / "versions"
-        / major_dir
-        / minor_dir
-        / annotation_version
-        / "cleaned_annotations.xml"
+    dataset_dir = Path("dataset") / "versions" / major_dir / minor_dir / annotation_version
+    annotation_file = dataset_dir / "cleaned_annotations.xml"
+    raw_annotations = dataset_dir / "annotations.xml"
+
+    if annotation_file.is_file():
+        return annotation_file
+
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(f"Dataset version directory not found: {dataset_dir}")
+    if not raw_annotations.is_file():
+        raise FileNotFoundError(
+            f"cleaned_annotations.xml missing and no annotations.xml to build from: {raw_annotations}"
+        )
+
+    print(
+        f"cleaned_annotations.xml not found for {annotation_version}; "
+        f"running dataset_parser.py {annotation_version} ..."
     )
-
-    if not annotation_file.exists():
-        raise ValueError(f"Annotation file not found: {annotation_file}")
-
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent / "dataset_parser.py"), annotation_version],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"dataset_parser.py failed with exit code {result.returncode} "
+            f"while building {annotation_file}"
+        )
+    if not annotation_file.is_file():
+        raise FileNotFoundError(
+            f"dataset_parser.py finished but cleaned annotations still missing: {annotation_file}"
+        )
     return annotation_file
 
 
@@ -750,9 +823,12 @@ def build_model(config, device):
         case 'dino_v2_base' | 'dino_v3_base':
             match head_cfg.type:
                 case 'simcc':
-                    head_kwargs = {}
                     if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
                         head_kwargs = build_joint_query_head_kwargs(head_cfg)
+                    elif head_cfg.name == 'depthwise_simcc':
+                        head_kwargs = build_depthwise_head_kwargs(head_cfg)
+                    else:
+                        head_kwargs = {}
                     return DinoCC(
                         NUM_JOINTS,
                         IMAGE_SIZE,
@@ -846,8 +922,9 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
         batch = samples[start:start + batch_size]
         pixels_batch = []
         keypoints_batch = []
+        role_batch = []
 
-        for image_path, keypoints, bbox in batch:
+        for image_path, keypoints, bbox, role in batch:
             image = Image.open(image_path).convert('RGB')
             crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
                 bbox, image.width, image.height
@@ -861,13 +938,15 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
             )
             pixels_batch.append(pixels)
             keypoints_batch.append(torch.from_numpy(crop_keypoints))
+            role_batch.append(encode_role(role))
 
         pixels_tensor = torch.stack(pixels_batch).to(device)
         keypoints_tensor = torch.stack(keypoints_batch)
+        role_tensor = torch.stack(role_batch).to(device)
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels_tensor)
+            pred_x, pred_y = model(pixels_tensor, role=role_tensor if USE_ROLE else None)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
 
         coordinates = torch.stack(
@@ -887,6 +966,7 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
                     'image_path': Path(batch[offset][0]),
                     'keypoints': batch[offset][1],
                     'bbox': batch[offset][2],
+                    'role': batch[offset][3],
                     'coordinates': coordinates[offset],
                 }
             )
@@ -1000,9 +1080,10 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
         batch = test_samples[start:start + batch_size]
         pixels_batch = []
         keypoints_batch = []
+        role_batch = []
         scales = []
 
-        for image_path, keypoints, bbox in batch:
+        for image_path, keypoints, bbox, role in batch:
             image = Image.open(image_path).convert('RGB')
             crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
                 bbox, image.width, image.height
@@ -1016,6 +1097,7 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
             )
             pixels_batch.append(pixels)
             keypoints_batch.append(torch.from_numpy(crop_keypoints))
+            role_batch.append(encode_role(role))
             scales.append(
                 person_scale_in_crop(
                     bbox,
@@ -1028,10 +1110,11 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
 
         pixels_tensor = torch.stack(pixels_batch).to(device)
         keypoints_tensor = torch.stack(keypoints_batch)
+        role_tensor = torch.stack(role_batch).to(device)
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels_tensor)
+            pred_x, pred_y = model(pixels_tensor, role=role_tensor if USE_ROLE else None)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
             coords, joint_conf = decode_simcc(pred_x, pred_y, SIMCC_SPLIT_RATIO)
 
@@ -1040,7 +1123,7 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
         keypoints_np = keypoints_tensor.numpy()
         losses_np = sample_losses.detach().cpu().numpy()
 
-        for offset, (image_path, _keypoints, _bbox) in enumerate(batch):
+        for offset, (image_path, _keypoints, _bbox, _role) in enumerate(batch):
             gt = keypoints_np[offset]
             visible = gt[:, 2] > 0
             if np.any(visible):
@@ -1074,7 +1157,7 @@ def export_checkpoint_metrics(model, checkpoint_path, test_samples, output_dir, 
 def main():
     parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
     parser.add_argument('--config', default='config.yaml')
-    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--workers', type=int, default=6)
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -1143,10 +1226,14 @@ def _run_training(args, config, run_dir, run_config_path):
         'head_kwargs': (
             build_joint_query_head_kwargs(head_cfg)
             if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc')
+            else build_depthwise_head_kwargs(head_cfg)
+            if head_cfg.name == 'depthwise_simcc'
             else {}
         ),
         'neck_dim': head_cfg.out_channels,
         'split_ratio': SIMCC_SPLIT_RATIO,
+        'use_role': USE_ROLE,
+        'role_encoding': 'lead_follow_bits',
     }
 
 
@@ -1165,7 +1252,8 @@ def _run_training(args, config, run_dir, run_config_path):
         f'Training on {device}; split_mode={training_cfg.split_mode}; '
         f'train images={split_index}/{len(image_paths)}, '
         f'test images={len(image_paths) - split_index}/{len(image_paths)}; '
-        f'train clips={train_clips}; test clips={test_clips}'
+        f'train clips={train_clips}; test clips={test_clips}; '
+        f'use_role={USE_ROLE} role_dropout={ROLE_DROPOUT if USE_ROLE else 0.0}'
     )
 
     for epoch in range(1, training_cfg.max_epochs + 1):
@@ -1189,6 +1277,8 @@ def _run_training(args, config, run_dir, run_config_path):
                     'head_kwargs': head_checkpoint_meta['head_kwargs'],
                     'neck_dim': head_checkpoint_meta['neck_dim'],
                     'split_ratio': head_checkpoint_meta['split_ratio'],
+                    'use_role': head_checkpoint_meta['use_role'],
+                    'role_encoding': head_checkpoint_meta['role_encoding'],
                     'config_path': str(run_config_path),
                     'seed': training_cfg.seed,
                     'split': split_label,
@@ -1216,6 +1306,8 @@ def _run_training(args, config, run_dir, run_config_path):
             'head_kwargs': head_checkpoint_meta['head_kwargs'],
             'neck_dim': head_checkpoint_meta['neck_dim'],
             'split_ratio': head_checkpoint_meta['split_ratio'],
+            'use_role': head_checkpoint_meta['use_role'],
+            'role_encoding': head_checkpoint_meta['role_encoding'],
             'config_path': str(run_config_path),
             'seed': training_cfg.seed,
             'split': split_label,

@@ -58,7 +58,7 @@ def compute_padded_crop(bbox, original_width, original_height, image_size, bbox_
 
 
 def parse_regions(data, image_width, image_height):
-    """Return list of xyxy bboxes from CVAT regions, or one full-frame fallback."""
+    """Return list of (xyxy bbox, role_or_None) from CVAT regions, or one full-frame fallback."""
     regions = data.get('regions') or []
     boxes = []
     for region in regions:
@@ -68,10 +68,43 @@ def parse_regions(data, image_width, image_height):
         x1, y1, x2, y2 = map(float, points[:4])
         if x2 <= x1 or y2 <= y1:
             continue
-        boxes.append((x1, y1, x2, y2))
+        role = region_role(region)
+        boxes.append(((x1, y1, x2, y2), role))
     if not boxes:
-        boxes.append((0.0, 0.0, float(image_width), float(image_height)))
+        boxes.append(((0.0, 0.0, float(image_width), float(image_height)), None))
     return boxes
+
+
+def region_role(region) -> str | None:
+    """Read lead/follow from CVAT region attributes if present."""
+    attributes = region.get('attributes') or {}
+    if isinstance(attributes, dict):
+        value = attributes.get('role')
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        return normalized if normalized in ('lead', 'follow') else None
+    if isinstance(attributes, list):
+        for item in attributes:
+            if not isinstance(item, dict):
+                continue
+            name = item.get('name') or item.get('key')
+            if name == 'role':
+                value = item.get('value') or item.get('text')
+                if value is None:
+                    return None
+                normalized = str(value).strip().lower()
+                return normalized if normalized in ('lead', 'follow') else None
+    return None
+
+
+def encode_role(role: str | None) -> torch.Tensor:
+    bits = torch.zeros(2, dtype=torch.float32)
+    if role == 'lead':
+        bits[0] = 1.0
+    elif role == 'follow':
+        bits[1] = 1.0
+    return bits
 
 
 def prepare_crop_tensor(image: Image.Image, crop_info, image_size: IVec2, device):
@@ -155,9 +188,13 @@ def init_context(context):
     context.user_data.bbox_padding = float(
         checkpoint.get('bbox_padding', DEFAULT_BBOX_PADDING)
     )
+    context.user_data.use_role = bool(checkpoint.get('use_role', False)) or bool(
+        (checkpoint.get('head_kwargs') or {}).get('use_role', False)
+    )
     context.logger.info(
         f"Loaded {checkpoint.get('head_name')} / {checkpoint.get('backbone_name')} "
-        f"image={image_size.x}x{image_size.y} joints={keypoint_names}"
+        f"image={image_size.x}x{image_size.y} joints={keypoint_names} "
+        f"use_role={context.user_data.use_role}"
     )
 
 
@@ -178,16 +215,20 @@ def handler(context, event):
         image_size = context.user_data.image_size
         split_ratio = context.user_data.split_ratio
         bbox_padding = context.user_data.bbox_padding
+        use_role = context.user_data.use_role
         names = context.user_data.keypoint_names
 
         skeletons = []
         with torch.inference_mode():
-            for bbox in boxes:
+            for bbox, role in boxes:
                 crop_info = compute_padded_crop(
                     bbox, image.width, image.height, image_size, bbox_padding
                 )
                 pixels = prepare_crop_tensor(image, crop_info, image_size, device)
-                pred_x, pred_y = model(pixels)
+                role_tensor = (
+                    encode_role(role).unsqueeze(0).to(device) if use_role else None
+                )
+                pred_x, pred_y = model(pixels, role=role_tensor)
                 coords, conf = decode_simcc(pred_x[0], pred_y[0], split_ratio)
                 coords = coords.cpu().numpy()
                 conf = conf.cpu().numpy()

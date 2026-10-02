@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw
 import torch
 
 from dino_cc import DinoCC
-from train import IMAGE_MEAN, IMAGE_SIZE, IMAGE_STD, KEYPOINT_IDS, BBOX_PADDING
+from train import IMAGE_MEAN, IMAGE_SIZE, IMAGE_STD, KEYPOINT_IDS, BBOX_PADDING, encode_role
 from vec import IVec2
 
 
@@ -116,6 +116,12 @@ def main():
     parser.add_argument('weights', type=Path, help='Path to a DinoCC checkpoint.')
     parser.add_argument('image', type=Path, help='Path to the image to process.')
     parser.add_argument('--bbox', nargs=4, type=float, metavar=('X1', 'Y1', 'X2', 'Y2'), help='Optional person bbox in source-image pixels.')
+    parser.add_argument(
+        '--role',
+        choices=('lead', 'follow'),
+        default=None,
+        help='Optional dance role for role-conditioned checkpoints ([is_lead, is_follow]).',
+    )
     parser.add_argument('--output', type=Path, default=Path('prediction_overlay.jpg'))
     args = parser.parse_args()
 
@@ -151,9 +157,15 @@ def main():
     cropped, crop_info = crop_image(image, bbox)
     pixels, _ = prepare_image(cropped, (0.0, 0.0, float(cropped.width), float(cropped.height)))
     pixels = pixels.to(device)
+    use_role = bool(checkpoint.get('use_role', False)) or bool(
+        (checkpoint.get('head_kwargs') or {}).get('use_role', False)
+    )
+    role = encode_role(args.role).unsqueeze(0).to(device) if use_role else None
+    if use_role and args.role is None:
+        print('Warning: role-conditioned checkpoint but --role not set; using [0, 0].')
 
     with torch.inference_mode():
-        pred_x, pred_y = model(pixels)
+        pred_x, pred_y = model(pixels, role=role)
         coordinates = torch.stack(
             (
                 pred_x[0].argmax(dim=-1).float() / 2.0,

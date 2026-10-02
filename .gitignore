@@ -4,6 +4,7 @@
 /__pycache__
 /training
 /temp
+/config.yaml
 *.pt
 *.safetensors
 *.jpg
