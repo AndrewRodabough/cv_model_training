@@ -1,0 +1,18 @@
+annotation_version: 1.4.6
+image_version: 1.0.1
+
+date: 2026-09-26
+
+description: New Frames added to lower count task 7 and 25
+
+changes:
+  - Added frames to task 25
+  - Added frames to task 7
+
+statistics:
+  frames_used: 380
+  tasks_used: 12
+  tracks: 21
+  track_frames: 546
+
+keypoints_used: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]

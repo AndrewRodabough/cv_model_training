@@ -1,0 +1,15 @@
+annotation_version: 1.2.2
+image_version: 1.0.0
+
+date: 2026-09-16
+
+description: added new clip
+
+changes:
+  - Added new clips to the dataset
+
+statistics:
+  frames_used: 226
+  tasks_used: 5
+
+keypoints_used: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]

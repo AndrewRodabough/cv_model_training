@@ -1,0 +1,18 @@
+annotation_version: 1.5.0
+image_version: 1.0.2
+
+date: 2026-09-27
+
+description: New attribute "role" added for feature encoding for pre processor training
+
+changes:
+  - fixed broken frame in task 7
+  - Added new attribute "role" to bbox and skeleton
+
+statistics:
+  frames_used: 402
+  tasks_used: 13
+  tracks: 33
+  track_frames: 592
+
+keypoints_used: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]

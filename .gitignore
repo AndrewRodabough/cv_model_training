@@ -1,6 +1,5 @@
 /weights
 /.vscode
-/dataset
 /__pycache__
 /training
 /temp
@@ -9,6 +8,11 @@
 *.safetensors
 *.jpg
 *.png
-!deploy/nuclio/weights/.gitkeep
 deploy/nuclio/weights/*.pt
 deploy/nuclio/__pycache__/
+!deploy/nuclio/weights/.gitkeep
+
+# Keep only dataset version manifests; ignore images/XML/etc.
+/dataset/**
+!/dataset/**/
+!/dataset/**/manifest.yaml

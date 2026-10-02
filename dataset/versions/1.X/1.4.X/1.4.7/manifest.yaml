@@ -1,0 +1,17 @@
+annotation_version: 1.4.7
+image_version: 1.0.1
+
+date: 2026-09-26
+
+description: New Frames from task 33
+
+changes:
+  - Added frames to task 33
+
+statistics:
+  frames_used: 390
+  tasks_used: 12
+  tracks: 21
+  track_frames: 566
+
+keypoints_used: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
