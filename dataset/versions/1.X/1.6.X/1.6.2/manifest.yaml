@@ -1,0 +1,18 @@
+annotation_version: 1.6.2
+image_version: 1.0.3
+
+date: 2026-10-02
+
+description: Removed accidentally added frames to various tasks
+
+changes:
+  - Removed accidentally added frames to various tasks
+  - adjusted some incorect frames across various tasks
+
+statistics:
+  frames_used: 419
+  tasks_used: 15
+  tracks: 37
+  track_frames: 626
+
+keypoints_used: [1, 2, 3, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
