@@ -132,6 +132,29 @@ class JointQuerySimCCConfig:
     role_dropout: float = 0.1
     # If false: query bias only (no FiLM on patch memory)
     role_film: bool = True
+    # Per-layer q/k conditioning: role + joint id (+ optional spatial) every decoder layer
+    per_layer_role_reinject: bool = False
+    use_spatial_prompt: bool = False
+    deep_supervision: bool = False
+    deep_supervision_aux_weight: float = 0.5
+    xy_consistency_loss_weight: float = 0.0
+
+
+@dataclass
+class CoupleJointQuerySimCCConfig:
+    """Couple head: 2K queries on union crops of lead+follow pairs."""
+
+    split_ratio: float
+    x_bins: int
+    y_bins: int
+    gaussian_sigma: float
+    num_heads: int = 8
+    num_layers: int = 2
+    dropout: float = 0.0
+    soft_foot_anchor: bool = False
+    soft_foot_anchor_init: float = 0.4
+    # Keep only lead+follow pairs with bbox IoU >= this threshold
+    couple_min_iou: float = 0.3
 
 @dataclass
 class TrainingConfig:
@@ -155,6 +178,11 @@ class TrainingConfig:
     aug_shift_frac: float = 0.1
     aug_rotation_deg: float = 12.0
     aug_color_jitter: float = 0.25
+    # Single-person only: drop samples whose max IoU with another person in-frame
+    # exceeds this. None = no filter. Solo people count as IoU 0.
+    max_partner_iou: float | None = None
+    # Phase A: weight on L1 bone-vector loss (0 = off). Applied on soft-decoded SimCC coords.
+    bone_loss_weight: float = 0.0
 
 @dataclass
 class keypoint_mapping:
@@ -169,6 +197,7 @@ IMAGE_SIZE = IVec2(384, 512)
 KEYPOINT_IDS = list(range(6, 12)) + list(range(15, 29))
 KEYPOINT_INDEX = {point_id: index for index, point_id in enumerate(KEYPOINT_IDS)}
 NUM_JOINTS = len(KEYPOINT_IDS)
+PERSON_JOINTS = NUM_JOINTS
 KEYPOINTS_BY_NAME: dict = {}
 BBOX_PADDING = 0.05
 SIMCC_SPLIT_RATIO = 2.0
@@ -186,6 +215,42 @@ AUG_COLOR_JITTER = 0.25
 USE_ROLE = False
 ROLE_DROPOUT = 0.1
 ROLE_DIM = 2
+COUPLE_MODE = False
+COUPLE_MIN_IOU = 0.3
+COUPLE_HEAD_NAME = 'couple_joint_query_self_attn_simcc'
+MAX_PARTNER_IOU: float | None = None
+USE_SPATIAL_PROMPT = False
+DEEP_SUPERVISION = False
+DEEP_SUPERVISION_AUX_WEIGHT = 0.5
+XY_CONSISTENCY_LOSS_WEIGHT = 0.0
+BONE_LOSS_WEIGHT = 0.0
+BONE_PAIRS: torch.Tensor = torch.empty(0, 2, dtype=torch.long)
+
+# Directed skeleton edges used for bone-vector loss and overlays (name → name).
+SKELETON_BONE_NAME_LINKS = (
+    ('shoulder_l', 'elbow_l'),
+    ('elbow_l', 'wrist_l'),
+    ('shoulder_r', 'elbow_r'),
+    ('elbow_r', 'wrist_r'),
+    ('shoulder_l', 'shoulder_r'),
+    ('shoulder_l', 'hip_l'),
+    ('shoulder_r', 'hip_r'),
+    ('hip_l', 'hip_r'),
+    ('hip_l', 'knee_l'),
+    ('knee_l', 'ankle_l'),
+    ('hip_r', 'knee_r'),
+    ('knee_r', 'ankle_r'),
+    ('heel_l', 'toe_b_l'),
+    ('heel_l', 'toe_s_l'),
+    ('ankle_l', 'heel_l'),
+    ('heel_l', 'heel_spike_l'),
+    ('toe_b_l', 'toe_s_l'),
+    ('heel_r', 'toe_b_r'),
+    ('heel_r', 'toe_s_r'),
+    ('ankle_r', 'heel_r'),
+    ('heel_r', 'heel_spike_r'),
+    ('toe_b_r', 'toe_s_r'),
+)
 
 
 def set_seed(seed):
@@ -211,8 +276,27 @@ def encode_role(role: str | None) -> torch.Tensor:
     return bits
 
 
+def bbox_iou(box_a, box_b) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return float(inter / (area_a + area_b - inter + 1e-9))
+
+
+def union_bbox(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    return (min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2))
+
+
 def parse_person(person):
-    keypoints = np.zeros((NUM_JOINTS, 3), dtype=np.float32)
+    keypoints = np.zeros((PERSON_JOINTS, 3), dtype=np.float32)
     for point in person.findall('keypoint'):
         point_id = int(point.get('id'))
         if point_id not in KEYPOINT_INDEX:
@@ -235,6 +319,13 @@ def horizontally_flip_keypoints(keypoints):
     for left_index, right_index in LEFT_RIGHT_PAIRS:
         flipped[[left_index, right_index]] = flipped[[right_index, left_index]]
     return flipped
+
+
+def horizontally_flip_couple_keypoints(keypoints):
+    """Flip stacked [lead|follow] keypoints; banks stay lead then follow."""
+    lead = horizontally_flip_keypoints(keypoints[:PERSON_JOINTS])
+    follow = horizontally_flip_keypoints(keypoints[PERSON_JOINTS:])
+    return np.concatenate([lead, follow], axis=0)
 
 
 def rotate_image_and_keypoints(image: Image.Image, keypoints: np.ndarray, angle_deg: float):
@@ -271,21 +362,9 @@ class KeypointDataset(Dataset):
         self.training = training
         self.repeats = repeats if training else 1
         if samples is None:
-            root = ET.parse(annotation_file).getroot()
-            samples = []
-            for video in root.findall('./project/videos/video'):
-                if video.get('id') not in task_ids:
-                    continue
-                for frame in video.findall('frame'):
-                    image_path = self.image_root / frame.get('image')
-                    for person in frame.findall('person'):
-                        keypoints, bbox, role = parse_person(person)
-                        if USE_ROLE and role is None:
-                            raise ValueError(
-                                f'Missing role on person in {image_path} '
-                                f'(track_id={person.get("track_id")})'
-                            )
-                        samples.append((image_path, keypoints, bbox, role))
+            samples = build_person_samples(
+                annotation_file, task_ids, max_partner_iou=MAX_PARTNER_IOU
+            )
 
         self.samples = list(samples)
 
@@ -340,7 +419,205 @@ class KeypointDataset(Dataset):
         pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255.0
         pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
         role_bits = encode_role(role)
-        return pixels, torch.from_numpy(keypoints), role_bits
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        spatial = crop_normalized_bbox_center(
+            cx, cy, crop_x1, crop_y1, crop_width, crop_height
+        )
+        return pixels, torch.from_numpy(keypoints), role_bits, spatial
+
+
+def build_person_samples(
+    annotation_file: Path,
+    task_ids,
+    max_partner_iou: float | None = None,
+):
+    """Build single-person samples; optionally drop high partner-overlap cases.
+
+    Each sample is ``(image_path, keypoints, bbox, role)``.
+    When ``max_partner_iou`` is set, keep a person only if their max IoU with any
+    other person in the same frame is ``<= max_partner_iou`` (solo → IoU 0).
+    """
+    root = ET.parse(annotation_file).getroot()
+    image_root = Path(annotation_file).parent
+    samples = []
+    n_total = 0
+    n_dropped = 0
+    for video in root.findall('./project/videos/video'):
+        if video.get('id') not in task_ids:
+            continue
+        for frame in video.findall('frame'):
+            image_path = image_root / frame.get('image')
+            people = []
+            for person in frame.findall('person'):
+                keypoints, bbox, role = parse_person(person)
+                if USE_ROLE and role is None:
+                    raise ValueError(
+                        f'Missing role on person in {image_path} '
+                        f'(track_id={person.get("track_id")})'
+                    )
+                people.append((keypoints, bbox, role))
+            for index, (keypoints, bbox, role) in enumerate(people):
+                n_total += 1
+                if max_partner_iou is not None:
+                    partner_iou = 0.0
+                    for other_i, (_ok, other_bbox, _or) in enumerate(people):
+                        if other_i == index:
+                            continue
+                        partner_iou = max(partner_iou, bbox_iou(bbox, other_bbox))
+                    if partner_iou > max_partner_iou:
+                        n_dropped += 1
+                        continue
+                samples.append((image_path, keypoints, bbox, role))
+    if not samples:
+        raise ValueError(
+            f'No person samples for task IDs {sorted(task_ids)}'
+            + (
+                f' after max_partner_iou={max_partner_iou} filter '
+                f'(dropped {n_dropped}/{n_total})'
+                if max_partner_iou is not None
+                else ''
+            )
+        )
+    if max_partner_iou is not None:
+        print(
+            f'Person IoU filter max_partner_iou={max_partner_iou}: '
+            f'kept {len(samples)}/{n_total}, dropped {n_dropped}'
+        )
+    return samples
+
+
+def build_couple_samples(annotation_file: Path, task_ids, min_iou: float):
+    """Build lead+follow pair samples with union bbox, filtered by IoU.
+
+    Each sample is:
+      (image_path, lead_kps, follow_kps, union_bbox, lead_bbox, follow_bbox, iou)
+    """
+    root = ET.parse(annotation_file).getroot()
+    image_root = Path(annotation_file).parent
+    samples = []
+    for video in root.findall('./project/videos/video'):
+        if video.get('id') not in task_ids:
+            continue
+        for frame in video.findall('frame'):
+            image_path = image_root / frame.get('image')
+            leads = []
+            follows = []
+            for person in frame.findall('person'):
+                keypoints, bbox, role = parse_person(person)
+                if role is None:
+                    continue
+                normalized = role.strip().lower()
+                if normalized == 'lead':
+                    leads.append((keypoints, bbox))
+                elif normalized == 'follow':
+                    follows.append((keypoints, bbox))
+            if not leads or not follows:
+                continue
+            best = None
+            best_iou = -1.0
+            for lead_kps, lead_bbox in leads:
+                for follow_kps, follow_bbox in follows:
+                    iou = bbox_iou(lead_bbox, follow_bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best = (lead_kps, follow_kps, lead_bbox, follow_bbox)
+            if best is None or best_iou < min_iou:
+                continue
+            lead_kps, follow_kps, lead_bbox, follow_bbox = best
+            samples.append(
+                (
+                    image_path,
+                    lead_kps,
+                    follow_kps,
+                    union_bbox(lead_bbox, follow_bbox),
+                    lead_bbox,
+                    follow_bbox,
+                    float(best_iou),
+                )
+            )
+    if not samples:
+        raise ValueError(
+            f'No couple samples with IoU >= {min_iou} for task IDs: {sorted(task_ids)}'
+        )
+    return samples
+
+
+class CoupleKeypointDataset(Dataset):
+    """Union-crop dataset for stacked [lead|follow] keypoints (2K joints)."""
+
+    def __init__(self, annotation_file: Path, task_ids, training=False, repeats=1, samples=None):
+        self.training = training
+        self.repeats = repeats if training else 1
+        if samples is None:
+            samples = build_couple_samples(annotation_file, task_ids, COUPLE_MIN_IOU)
+        self.samples = list(samples)
+        if not self.samples:
+            raise ValueError(f'No couple samples found for task IDs: {sorted(task_ids)}')
+
+    def __len__(self):
+        return len(self.samples) * self.repeats
+
+    def __getitem__(self, index):
+        (
+            image_path,
+            lead_kps,
+            follow_kps,
+            union_box,
+            _lead_bbox,
+            _follow_bbox,
+            _iou,
+        ) = self.samples[index % len(self.samples)]
+        image = Image.open(image_path).convert('RGB')
+        original_width, original_height = image.size
+
+        if self.training:
+            scale = random.uniform(AUG_SCALE_MIN, AUG_SCALE_MAX)
+            shift_x_frac = random.uniform(-AUG_SHIFT_FRAC, AUG_SHIFT_FRAC)
+            shift_y_frac = random.uniform(-AUG_SHIFT_FRAC, AUG_SHIFT_FRAC)
+        else:
+            scale = 1.0
+            shift_x_frac = 0.0
+            shift_y_frac = 0.0
+
+        crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+            union_box,
+            original_width,
+            original_height,
+            scale=scale,
+            shift_x_frac=shift_x_frac,
+            shift_y_frac=shift_y_frac,
+        )
+        image = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+        image = image.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+
+        lead = transform_keypoints_to_crop(
+            lead_kps, crop_x1, crop_y1, crop_width, crop_height
+        )
+        follow = transform_keypoints_to_crop(
+            follow_kps, crop_x1, crop_y1, crop_width, crop_height
+        )
+        keypoints = np.concatenate([lead, follow], axis=0)
+
+        if self.training:
+            if random.random() < 0.5:
+                image = ImageOps.mirror(image)
+                keypoints = horizontally_flip_couple_keypoints(keypoints)
+            if AUG_ROTATION_DEG > 0:
+                angle = random.uniform(-AUG_ROTATION_DEG, AUG_ROTATION_DEG)
+                image, keypoints = rotate_image_and_keypoints(image, keypoints, angle)
+            color_lo = 1.0 - AUG_COLOR_JITTER
+            color_hi = 1.0 + AUG_COLOR_JITTER
+            image = ImageEnhance.Brightness(image).enhance(random.uniform(color_lo, color_hi))
+            image = ImageEnhance.Contrast(image).enhance(random.uniform(color_lo, color_hi))
+            image = ImageEnhance.Color(image).enhance(random.uniform(color_lo, color_hi))
+
+        pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255.0
+        pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+        # Dummy role zeros so the shared train loop can unpack (pixels, kps, role).
+        role_bits = torch.zeros(ROLE_DIM, dtype=torch.float32)
+        spatial = torch.zeros(2, dtype=torch.float32)
+        return pixels, torch.from_numpy(keypoints), role_bits, spatial
 
 
 def make_loader(dataset, batch_size, workers):
@@ -398,6 +675,32 @@ def build_foot_anchor_pairs(keypoints_by_name: dict) -> list[tuple[int, int]]:
     return pairs
 
 
+def build_bone_index_pairs(keypoints_by_name: dict) -> list[tuple[int, int]]:
+    """Local-id directed bones for vector loss (parent → child)."""
+    pairs = []
+    for parent_name, child_name in SKELETON_BONE_NAME_LINKS:
+        if parent_name not in keypoints_by_name or child_name not in keypoints_by_name:
+            continue
+        pairs.append(
+            (
+                int(keypoints_by_name[parent_name]['id']),
+                int(keypoints_by_name[child_name]['id']),
+            )
+        )
+    if not pairs:
+        raise ValueError('No bone pairs resolved from keypoint format mapping')
+    return pairs
+
+
+def build_couple_foot_anchor_pairs(keypoints_by_name: dict) -> list[tuple[int, int]]:
+    """Duplicate single-person foot anchors into lead and follow banks."""
+    person_pairs = build_foot_anchor_pairs(keypoints_by_name)
+    follow_offset = len(keypoints_by_name)
+    return list(person_pairs) + [
+        (foot + follow_offset, ankle + follow_offset) for foot, ankle in person_pairs
+    ]
+
+
 def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
     custom = head_cfg.custom
     kwargs = {
@@ -406,11 +709,21 @@ def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
         'dropout': custom.dropout,
         'soft_foot_anchor': custom.soft_foot_anchor,
         'soft_foot_anchor_init': custom.soft_foot_anchor_init,
-        'use_role': custom.use_role,
-        'role_film': custom.role_film,
+        'per_layer_role_reinject': getattr(custom, 'per_layer_role_reinject', False),
+        'use_spatial_prompt': getattr(custom, 'use_spatial_prompt', False),
+        'deep_supervision': getattr(custom, 'deep_supervision', False),
     }
-    if custom.soft_foot_anchor:
-        kwargs['foot_anchor_pairs'] = build_foot_anchor_pairs(head_cfg.keypoints)
+    if head_cfg.name == COUPLE_HEAD_NAME:
+        kwargs['person_joints'] = PERSON_JOINTS
+        kwargs['use_role'] = False
+        kwargs['role_film'] = False
+        if custom.soft_foot_anchor:
+            kwargs['foot_anchor_pairs'] = build_couple_foot_anchor_pairs(head_cfg.keypoints)
+    else:
+        kwargs['use_role'] = custom.use_role
+        kwargs['role_film'] = custom.role_film
+        if custom.soft_foot_anchor:
+            kwargs['foot_anchor_pairs'] = build_foot_anchor_pairs(head_cfg.keypoints)
     return kwargs
 
 
@@ -436,11 +749,13 @@ def build_oks_sigmas(oks_sigmas: dict[str, float] | None, keypoints_by_name: dic
 
 def setup_from_config(config):
     """Apply image / SimCC / keypoint globals from the parsed config."""
-    global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, KEYPOINTS_BY_NAME
+    global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, PERSON_JOINTS, KEYPOINTS_BY_NAME
     global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
     global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS, OKS_SIGMAS
     global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
-    global USE_ROLE, ROLE_DROPOUT
+    global USE_ROLE, ROLE_DROPOUT, COUPLE_MODE, COUPLE_MIN_IOU, MAX_PARTNER_IOU
+    global USE_SPATIAL_PROMPT, DEEP_SUPERVISION, DEEP_SUPERVISION_AUX_WEIGHT
+    global XY_CONSISTENCY_LOSS_WEIGHT, BONE_LOSS_WEIGHT, BONE_PAIRS
 
     image_cfg: ImageConfig = config['image']
     head_cfg: HeadConfig = config['head']
@@ -479,10 +794,55 @@ def setup_from_config(config):
     if AUG_COLOR_JITTER < 0 or AUG_COLOR_JITTER >= 1:
         raise ValueError(f'aug_color_jitter must be in [0, 1), got {AUG_COLOR_JITTER}')
 
-    USE_ROLE = bool(getattr(head_cfg.custom, 'use_role', False))
-    ROLE_DROPOUT = float(getattr(head_cfg.custom, 'role_dropout', 0.1))
-    if not 0.0 <= ROLE_DROPOUT <= 1.0:
-        raise ValueError(f'role_dropout must be in [0, 1], got {ROLE_DROPOUT}')
+    COUPLE_MODE = head_cfg.name == COUPLE_HEAD_NAME
+    if COUPLE_MODE:
+        USE_ROLE = False
+        ROLE_DROPOUT = 0.0
+        COUPLE_MIN_IOU = float(getattr(head_cfg.custom, 'couple_min_iou', 0.3))
+        MAX_PARTNER_IOU = None
+        if not 0.0 <= COUPLE_MIN_IOU <= 1.0:
+            raise ValueError(f'couple_min_iou must be in [0, 1], got {COUPLE_MIN_IOU}')
+    else:
+        USE_ROLE = bool(getattr(head_cfg.custom, 'use_role', False))
+        ROLE_DROPOUT = float(getattr(head_cfg.custom, 'role_dropout', 0.1))
+        COUPLE_MIN_IOU = 0.3
+        if not 0.0 <= ROLE_DROPOUT <= 1.0:
+            raise ValueError(f'role_dropout must be in [0, 1], got {ROLE_DROPOUT}')
+        max_partner = getattr(training_cfg, 'max_partner_iou', None)
+        if max_partner is None:
+            MAX_PARTNER_IOU = None
+        else:
+            MAX_PARTNER_IOU = float(max_partner)
+            if not 0.0 <= MAX_PARTNER_IOU <= 1.0:
+                raise ValueError(
+                    f'max_partner_iou must be in [0, 1], got {MAX_PARTNER_IOU}'
+                )
+        custom = head_cfg.custom
+        USE_SPATIAL_PROMPT = bool(getattr(custom, 'use_spatial_prompt', False))
+        DEEP_SUPERVISION = bool(getattr(custom, 'deep_supervision', False))
+        DEEP_SUPERVISION_AUX_WEIGHT = float(
+            getattr(custom, 'deep_supervision_aux_weight', 0.5)
+        )
+        XY_CONSISTENCY_LOSS_WEIGHT = float(
+            getattr(custom, 'xy_consistency_loss_weight', 0.0)
+        )
+        if DEEP_SUPERVISION_AUX_WEIGHT < 0:
+            raise ValueError(
+                f'deep_supervision_aux_weight must be >= 0, got {DEEP_SUPERVISION_AUX_WEIGHT}'
+            )
+        if XY_CONSISTENCY_LOSS_WEIGHT < 0:
+            raise ValueError(
+                f'xy_consistency_loss_weight must be >= 0, got {XY_CONSISTENCY_LOSS_WEIGHT}'
+            )
+
+    if COUPLE_MODE:
+        USE_SPATIAL_PROMPT = False
+        DEEP_SUPERVISION = False
+        XY_CONSISTENCY_LOSS_WEIGHT = 0.0
+
+    BONE_LOSS_WEIGHT = float(getattr(training_cfg, 'bone_loss_weight', 0.0))
+    if BONE_LOSS_WEIGHT < 0:
+        raise ValueError(f'bone_loss_weight must be >= 0, got {BONE_LOSS_WEIGHT}')
 
     ordered = sorted(head_cfg.keypoints.items(), key=lambda item: item[1]['id'])
     local_ids = [meta['id'] for _, meta in ordered]
@@ -493,7 +853,8 @@ def setup_from_config(config):
     KEYPOINTS_BY_NAME = head_cfg.keypoints
     KEYPOINT_IDS = [meta['standard_id'] for _, meta in ordered]
     KEYPOINT_INDEX = {meta['standard_id']: meta['id'] for _, meta in ordered}
-    NUM_JOINTS = len(ordered)
+    PERSON_JOINTS = len(ordered)
+    NUM_JOINTS = PERSON_JOINTS * 2 if COUPLE_MODE else PERSON_JOINTS
 
     if head_cfg.type == 'simcc':
         simcc = head_cfg.custom
@@ -508,13 +869,29 @@ def setup_from_config(config):
                 f'got x_bins={simcc.x_bins}, y_bins={simcc.y_bins})'
             )
 
-    JOINT_LOSS_WEIGHTS = build_joint_loss_weights(
+    person_loss_weights = build_joint_loss_weights(
         training_cfg.joint_loss_weights, head_cfg.keypoints
+    )
+    JOINT_LOSS_WEIGHTS = (
+        torch.cat([person_loss_weights, person_loss_weights], dim=0)
+        if COUPLE_MODE
+        else person_loss_weights
     )
     LEFT_RIGHT_PAIRS = build_left_right_index_pairs(
         head_cfg.left_right_pairs, head_cfg.keypoints
     )
+    person_bones = build_bone_index_pairs(head_cfg.keypoints)
+    if COUPLE_MODE:
+        follow_offset = PERSON_JOINTS
+        BONE_PAIRS = torch.tensor(
+            person_bones
+            + [(i + follow_offset, j + follow_offset) for i, j in person_bones],
+            dtype=torch.long,
+        )
+    else:
+        BONE_PAIRS = torch.tensor(person_bones, dtype=torch.long)
     if head_cfg.oks_sigmas:
+        # Always person-sized; couple eval splits banks before OKS.
         OKS_SIGMAS = build_oks_sigmas(head_cfg.oks_sigmas, head_cfg.keypoints)
     else:
         OKS_SIGMAS = torch.empty(0)
@@ -556,6 +933,22 @@ def compute_padded_crop(
     crop_x1 = max(0.0, min(center_x - crop_width / 2, original_width - crop_width))
     crop_y1 = max(0.0, min(center_y - crop_height / 2, original_height - crop_height))
     return crop_x1, crop_y1, crop_width, crop_height
+
+
+def crop_normalized_bbox_center(
+    center_x: float,
+    center_y: float,
+    crop_x1: float,
+    crop_y1: float,
+    crop_width: float,
+    crop_height: float,
+) -> torch.Tensor:
+    """Person bbox center in crop-normalized [0, 1]^2 coordinates."""
+    cx = (center_x - crop_x1) / max(crop_width, 1e-6)
+    cy = (center_y - crop_y1) / max(crop_height, 1e-6)
+    cx = float(min(max(cx, 0.0), 1.0))
+    cy = float(min(max(cy, 0.0), 1.0))
+    return torch.tensor([cx, cy], dtype=torch.float32)
 
 
 def transform_keypoints_to_crop(keypoints, crop_x1, crop_y1, crop_width, crop_height):
@@ -666,22 +1059,124 @@ def maybe_drop_role(role: torch.Tensor, training: bool) -> torch.Tensor:
     return role * keep.to(role.dtype)
 
 
+def forward_model(model, pixels, role, spatial):
+    """Run DinoCC; returns (pred_x, pred_y, aux_list | None)."""
+    out = model(
+        pixels,
+        role=role if USE_ROLE else None,
+        spatial=spatial if USE_SPATIAL_PROMPT else None,
+    )
+    if isinstance(out, tuple) and len(out) == 3:
+        return out[0], out[1], out[2]
+    return out[0], out[1], None
+
+
+def soft_decode_simcc_coords(
+    pred_x: torch.Tensor,
+    pred_y: torch.Tensor,
+    split_ratio: float,
+) -> torch.Tensor:
+    """Differentiable SimCC decode → [B, K, 2] crop pixels via expectation."""
+    px = torch.nn.functional.softmax(pred_x.float(), dim=-1)
+    py = torch.nn.functional.softmax(pred_y.float(), dim=-1)
+    bins_x = torch.arange(pred_x.shape[-1], device=pred_x.device, dtype=px.dtype)
+    bins_y = torch.arange(pred_y.shape[-1], device=pred_y.device, dtype=py.dtype)
+    x = (px * bins_x).sum(dim=-1) / split_ratio
+    y = (py * bins_y).sum(dim=-1) / split_ratio
+    return torch.stack((x, y), dim=-1)
+
+
+def bone_vector_loss(
+    pred_xy: torch.Tensor,
+    gt_keypoints: torch.Tensor,
+    bone_pairs: torch.Tensor,
+) -> torch.Tensor:
+    """L1 on predicted vs GT bone vectors (normalized by image diagonal)."""
+    if bone_pairs.numel() == 0:
+        return pred_xy.new_zeros(())
+    pairs = bone_pairs.to(device=pred_xy.device)
+    parent = pairs[:, 0]
+    child = pairs[:, 1]
+    pred_vec = pred_xy[:, child] - pred_xy[:, parent]  # [B, N, 2]
+    gt_xy = gt_keypoints[..., :2].to(device=pred_xy.device, dtype=pred_xy.dtype)
+    gt_vec = gt_xy[:, child] - gt_xy[:, parent]
+    vis = gt_keypoints[..., 2].to(device=pred_xy.device)
+    valid = (vis[:, parent] > 0) & (vis[:, child] > 0)  # [B, N]
+    err = (pred_vec - gt_vec).abs().sum(dim=-1)  # [B, N]
+    diag = (IMAGE_SIZE.x ** 2 + IMAGE_SIZE.y ** 2) ** 0.5
+    err = err / max(float(diag), 1e-6)
+    return (err * valid).sum() / (valid.sum() + 1e-6)
+
+
+def simcc_xy_consistency_loss(pred_x, pred_y, target_x, target_y, weights):
+    """KL between factored pred marginals and factored GT SimCC (outer product)."""
+    px = torch.nn.functional.softmax(pred_x, dim=-1)
+    py = torch.nn.functional.softmax(pred_y, dim=-1)
+    pred_2d = px.unsqueeze(-1) * py.unsqueeze(-2)
+    tgt_2d = target_x.unsqueeze(-1) * target_y.unsqueeze(-2)
+    tgt_2d = tgt_2d / (tgt_2d.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+    log_pred = torch.log(pred_2d.clamp(min=1e-8))
+    kl = torch.nn.functional.kl_div(log_pred, tgt_2d, reduction='none').sum(dim=(-2, -1))
+    return (kl * weights).sum() / (weights.sum() + 1e-6)
+
+
+def compute_simcc_training_loss(
+    criterion,
+    pred_x,
+    pred_y,
+    target_x,
+    target_y,
+    weights,
+    aux_preds,
+    gt_keypoints=None,
+):
+    loss = criterion(pred_x, pred_y, target_x, target_y, weights)
+    if aux_preds:
+        for aux_x, aux_y in aux_preds:
+            loss = loss + DEEP_SUPERVISION_AUX_WEIGHT * criterion(
+                aux_x, aux_y, target_x, target_y, weights
+            )
+    if XY_CONSISTENCY_LOSS_WEIGHT > 0:
+        loss = loss + XY_CONSISTENCY_LOSS_WEIGHT * simcc_xy_consistency_loss(
+            pred_x, pred_y, target_x, target_y, weights
+        )
+    if BONE_LOSS_WEIGHT > 0 and gt_keypoints is not None:
+        pred_xy = soft_decode_simcc_coords(pred_x, pred_y, SIMCC_SPLIT_RATIO)
+        loss = loss + BONE_LOSS_WEIGHT * bone_vector_loss(
+            pred_xy, gt_keypoints, BONE_PAIRS
+        )
+    return loss
+
+
 def run_epoch(model, loader, criterion, optimizer, device, scaler, training, gradient_clip_norm):
     model.train(training)
     total_loss = 0.0
 
-    for pixels, keypoints, role in loader:
+    for pixels, keypoints, role, spatial in loader:
         pixels = pixels.to(device, non_blocking=True)
         role = role.to(device, non_blocking=True)
+        spatial = spatial.to(device, non_blocking=True)
         role = maybe_drop_role(role, training)
         target_x, target_y, weights = make_targets(keypoints, device)
+        gt_keypoints = (
+            keypoints.to(device, non_blocking=True) if BONE_LOSS_WEIGHT > 0 else None
+        )
 
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels, role=role if USE_ROLE else None)
-            loss = criterion(pred_x, pred_y, target_x, target_y, weights)
+            pred_x, pred_y, aux_preds = forward_model(model, pixels, role, spatial)
+            loss = compute_simcc_training_loss(
+                criterion,
+                pred_x,
+                pred_y,
+                target_x,
+                target_y,
+                weights,
+                aux_preds,
+                gt_keypoints=gt_keypoints,
+            )
 
         if training:
             scaler.scale(loss).backward()
@@ -792,11 +1287,13 @@ def parse_config(raw_config):
             head_cfg.custom = SimCCConfig(**head_cfg.custom)
         case 'joint_query_simcc' | 'joint_query_self_attn_simcc':
             head_cfg.custom = JointQuerySimCCConfig(**head_cfg.custom)
+        case 'couple_joint_query_self_attn_simcc':
+            head_cfg.custom = CoupleJointQuerySimCCConfig(**head_cfg.custom)
         case _:
             raise ValueError(
                 f'Unsupported head name: {head_cfg.name}; '
                 f"expected 'depthwise_simcc', 'joint_query_simcc', "
-                f"or 'joint_query_self_attn_simcc'"
+                f"'joint_query_self_attn_simcc', or 'couple_joint_query_self_attn_simcc'"
             )
 
     return {
@@ -823,7 +1320,12 @@ def build_model(config, device):
         case 'dino_v2_base' | 'dino_v3_base':
             match head_cfg.type:
                 case 'simcc':
-                    if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc'):
+                    joint_query_heads = (
+                        'joint_query_simcc',
+                        'joint_query_self_attn_simcc',
+                        COUPLE_HEAD_NAME,
+                    )
+                    if head_cfg.name in joint_query_heads:
                         head_kwargs = build_joint_query_head_kwargs(head_cfg)
                     elif head_cfg.name == 'depthwise_simcc':
                         head_kwargs = build_depthwise_head_kwargs(head_cfg)
@@ -848,15 +1350,20 @@ def build_model(config, device):
 
 
 def load_test_samples(config):
-    """Rebuild the train/test split and return the test person-samples."""
+    """Rebuild the train/test split and return the test person/couple samples."""
     dataset_cfg: DatasetConfig = config['dataset']
     training_cfg: TrainingConfig = config['training']
     annotation_file = get_annotation_file_path(dataset_cfg.annotation_version)
     root = ET.parse(annotation_file).getroot()
     task_ids = [video.get('id') for video in root.findall('./project/videos/video')]
-    full_dataset = KeypointDataset(annotation_file, set(task_ids))
+    if COUPLE_MODE:
+        full_samples = build_couple_samples(annotation_file, set(task_ids), COUPLE_MIN_IOU)
+    else:
+        full_samples = build_person_samples(
+            annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
+        )
     _, test_samples, _, _ = split_samples_by_image(
-        full_dataset.samples,
+        full_samples,
         training_cfg.train_test_split,
         training_cfg.seed,
         split_mode=training_cfg.split_mode,
@@ -865,32 +1372,8 @@ def load_test_samples(config):
 
 
 def build_skeleton_connections(keypoints_by_name: dict) -> list[tuple[int, int]]:
-    name_links = (
-        ('shoulder_l', 'elbow_l'),
-        ('elbow_l', 'wrist_l'),
-        ('shoulder_r', 'elbow_r'),
-        ('elbow_r', 'wrist_r'),
-        ('shoulder_l', 'shoulder_r'),
-        ('shoulder_l', 'hip_l'),
-        ('shoulder_r', 'hip_r'),
-        ('hip_l', 'hip_r'),
-        ('hip_l', 'knee_l'),
-        ('knee_l', 'ankle_l'),
-        ('hip_r', 'knee_r'),
-        ('knee_r', 'ankle_r'),
-        ('heel_l', 'toe_b_l'),
-        ('heel_l', 'toe_s_l'),
-        ('ankle_l', 'heel_l'),
-        ('heel_l', 'heel_spike_l'),
-        ('toe_b_l', 'toe_s_l'),
-        ('heel_r', 'toe_b_r'),
-        ('heel_r', 'toe_s_r'),
-        ('ankle_r', 'heel_r'),
-        ('heel_r', 'heel_spike_r'),
-        ('toe_b_r', 'toe_s_r'),
-    )
     connections = []
-    for left_name, right_name in name_links:
+    for left_name, right_name in SKELETON_BONE_NAME_LINKS:
         if left_name not in keypoints_by_name or right_name not in keypoints_by_name:
             continue
         connections.append(
@@ -914,7 +1397,7 @@ def per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights):
 
 @torch.inference_mode()
 def rank_test_samples_by_loss(model, samples, device, batch_size):
-    """Score every test person-sample by SimCC loss; highest loss first."""
+    """Score every test sample by SimCC loss; highest loss first."""
     model.eval()
     ranked = []
 
@@ -923,30 +1406,87 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
         pixels_batch = []
         keypoints_batch = []
         role_batch = []
+        spatial_batch = []
+        prepared = []
 
-        for image_path, keypoints, bbox, role in batch:
-            image = Image.open(image_path).convert('RGB')
-            crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
-                bbox, image.width, image.height
-            )
-            crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
-            crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
-            pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
-            pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
-            crop_keypoints = transform_keypoints_to_crop(
-                keypoints, crop_x1, crop_y1, crop_width, crop_height
-            )
+        for sample in batch:
+            if COUPLE_MODE:
+                (
+                    image_path,
+                    lead_kps,
+                    follow_kps,
+                    union_box,
+                    lead_bbox,
+                    follow_bbox,
+                    iou,
+                ) = sample
+                image = Image.open(image_path).convert('RGB')
+                crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+                    union_box, image.width, image.height
+                )
+                crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+                crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+                pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
+                pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+                lead = transform_keypoints_to_crop(
+                    lead_kps, crop_x1, crop_y1, crop_width, crop_height
+                )
+                follow = transform_keypoints_to_crop(
+                    follow_kps, crop_x1, crop_y1, crop_width, crop_height
+                )
+                crop_keypoints = np.concatenate([lead, follow], axis=0)
+                role_bits = torch.zeros(ROLE_DIM, dtype=torch.float32)
+                spatial_bits = torch.zeros(2, dtype=torch.float32)
+                prepared.append(
+                    {
+                        'image_path': Path(image_path),
+                        'bbox': union_box,
+                        'lead_bbox': lead_bbox,
+                        'follow_bbox': follow_bbox,
+                        'iou': iou,
+                        'role': None,
+                    }
+                )
+            else:
+                image_path, keypoints, bbox, role = sample
+                image = Image.open(image_path).convert('RGB')
+                crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+                    bbox, image.width, image.height
+                )
+                crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+                crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+                pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
+                pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+                crop_keypoints = transform_keypoints_to_crop(
+                    keypoints, crop_x1, crop_y1, crop_width, crop_height
+                )
+                role_bits = encode_role(role)
+                cx = (bbox[0] + bbox[2]) / 2.0
+                cy = (bbox[1] + bbox[3]) / 2.0
+                spatial_bits = crop_normalized_bbox_center(
+                    cx, cy, crop_x1, crop_y1, crop_width, crop_height
+                )
+                prepared.append(
+                    {
+                        'image_path': Path(image_path),
+                        'bbox': bbox,
+                        'role': role,
+                    }
+                )
+
             pixels_batch.append(pixels)
             keypoints_batch.append(torch.from_numpy(crop_keypoints))
-            role_batch.append(encode_role(role))
+            role_batch.append(role_bits)
+            spatial_batch.append(spatial_bits)
 
         pixels_tensor = torch.stack(pixels_batch).to(device)
         keypoints_tensor = torch.stack(keypoints_batch)
         role_tensor = torch.stack(role_batch).to(device)
+        spatial_tensor = torch.stack(spatial_batch).to(device)
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels_tensor, role=role_tensor if USE_ROLE else None)
+            pred_x, pred_y, _aux = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
 
         coordinates = torch.stack(
@@ -959,17 +1499,19 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
 
         for offset, loss in enumerate(sample_losses.detach().cpu().tolist()):
             sample_index = start + offset
-            ranked.append(
-                {
-                    'index': sample_index,
-                    'loss': float(loss),
-                    'image_path': Path(batch[offset][0]),
-                    'keypoints': batch[offset][1],
-                    'bbox': batch[offset][2],
-                    'role': batch[offset][3],
-                    'coordinates': coordinates[offset],
-                }
-            )
+            item = {
+                'index': sample_index,
+                'loss': float(loss),
+                'image_path': prepared[offset]['image_path'],
+                'bbox': prepared[offset]['bbox'],
+                'role': prepared[offset]['role'],
+                'coordinates': coordinates[offset],
+            }
+            if COUPLE_MODE:
+                item['lead_bbox'] = prepared[offset]['lead_bbox']
+                item['follow_bbox'] = prepared[offset]['follow_bbox']
+                item['iou'] = prepared[offset]['iou']
+            ranked.append(item)
 
     ranked.sort(key=lambda item: item['loss'], reverse=True)
     return ranked
@@ -987,32 +1529,44 @@ def draw_prediction_overlay(image_path, bbox, coordinates, output_path, loss=Non
         width=1,
     )
 
-    points = []
-    for x, y in coordinates:
-        points.append(
-            (
-                crop_x1 + float(x) * crop_width / IMAGE_SIZE.x,
-                crop_y1 + float(y) * crop_height / IMAGE_SIZE.y,
+    connections = build_skeleton_connections(KEYPOINTS_BY_NAME)
+    banks = (
+        [(0, PERSON_JOINTS, 'lime', 'red'), (PERSON_JOINTS, 2 * PERSON_JOINTS, 'cyan', 'magenta')]
+        if COUPLE_MODE and len(coordinates) == 2 * PERSON_JOINTS
+        else [(0, len(coordinates), 'lime', 'red')]
+    )
+
+    for start, end, line_color, point_color in banks:
+        bank_coords = coordinates[start:end]
+        points = []
+        for x, y in bank_coords:
+            points.append(
+                (
+                    crop_x1 + float(x) * crop_width / IMAGE_SIZE.x,
+                    crop_y1 + float(y) * crop_height / IMAGE_SIZE.y,
+                )
             )
-        )
+        point_by_id = dict(zip(KEYPOINT_IDS, points))
+        for first_id, second_id in connections:
+            first = point_by_id.get(first_id)
+            second = point_by_id.get(second_id)
+            if first is not None and second is not None:
+                draw.line((first, second), fill=line_color, width=1)
 
-    point_by_id = dict(zip(KEYPOINT_IDS, points))
-    for first_id, second_id in build_skeleton_connections(KEYPOINTS_BY_NAME):
-        first = point_by_id.get(first_id)
-        second = point_by_id.get(second_id)
-        if first is not None and second is not None:
-            draw.line((first, second), fill='lime', width=1)
-
-    for index, (x, y) in enumerate(points):
-        radius = 2
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill='red', outline='white')
-        draw.text(
-            (x + 4, y - 4),
-            str(KEYPOINT_IDS[index]),
-            fill='white',
-            stroke_width=1,
-            stroke_fill='black',
-        )
+        for index, (x, y) in enumerate(points):
+            radius = 2
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=point_color,
+                outline='white',
+            )
+            draw.text(
+                (x + 4, y - 4),
+                str(KEYPOINT_IDS[index]),
+                fill='white',
+                stroke_width=1,
+                stroke_fill='black',
+            )
 
     if loss is not None:
         draw.text(
@@ -1081,40 +1635,95 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
         pixels_batch = []
         keypoints_batch = []
         role_batch = []
-        scales = []
+        spatial_batch = []
+        meta = []
 
-        for image_path, keypoints, bbox, role in batch:
-            image = Image.open(image_path).convert('RGB')
-            crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
-                bbox, image.width, image.height
-            )
-            crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
-            crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
-            pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
-            pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
-            crop_keypoints = transform_keypoints_to_crop(
-                keypoints, crop_x1, crop_y1, crop_width, crop_height
-            )
+        for sample in batch:
+            if COUPLE_MODE:
+                (
+                    image_path,
+                    lead_kps,
+                    follow_kps,
+                    union_box,
+                    lead_bbox,
+                    follow_bbox,
+                    _iou,
+                ) = sample
+                image = Image.open(image_path).convert('RGB')
+                crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+                    union_box, image.width, image.height
+                )
+                crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+                crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+                pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
+                pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+                lead = transform_keypoints_to_crop(
+                    lead_kps, crop_x1, crop_y1, crop_width, crop_height
+                )
+                follow = transform_keypoints_to_crop(
+                    follow_kps, crop_x1, crop_y1, crop_width, crop_height
+                )
+                crop_keypoints = np.concatenate([lead, follow], axis=0)
+                role_bits = torch.zeros(ROLE_DIM, dtype=torch.float32)
+                spatial_bits = torch.zeros(2, dtype=torch.float32)
+                lead_scale = person_scale_in_crop(
+                    lead_bbox, crop_width, crop_height, IMAGE_SIZE.x, IMAGE_SIZE.y
+                )
+                follow_scale = person_scale_in_crop(
+                    follow_bbox, crop_width, crop_height, IMAGE_SIZE.x, IMAGE_SIZE.y
+                )
+                meta.append(
+                    {
+                        'image_path': image_path,
+                        'lead_scale': lead_scale,
+                        'follow_scale': follow_scale,
+                    }
+                )
+            else:
+                image_path, keypoints, bbox, role = sample
+                image = Image.open(image_path).convert('RGB')
+                crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
+                    bbox, image.width, image.height
+                )
+                crop = image.crop((crop_x1, crop_y1, crop_x1 + crop_width, crop_y1 + crop_height))
+                crop = crop.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
+                pixels = torch.from_numpy(np.asarray(crop, dtype=np.float32)).permute(2, 0, 1) / 255.0
+                pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
+                crop_keypoints = transform_keypoints_to_crop(
+                    keypoints, crop_x1, crop_y1, crop_width, crop_height
+                )
+                role_bits = encode_role(role)
+                cx = (bbox[0] + bbox[2]) / 2.0
+                cy = (bbox[1] + bbox[3]) / 2.0
+                spatial_bits = crop_normalized_bbox_center(
+                    cx, cy, crop_x1, crop_y1, crop_width, crop_height
+                )
+                meta.append(
+                    {
+                        'image_path': image_path,
+                        'scale': person_scale_in_crop(
+                            bbox,
+                            crop_width,
+                            crop_height,
+                            IMAGE_SIZE.x,
+                            IMAGE_SIZE.y,
+                        ),
+                    }
+                )
+
             pixels_batch.append(pixels)
             keypoints_batch.append(torch.from_numpy(crop_keypoints))
-            role_batch.append(encode_role(role))
-            scales.append(
-                person_scale_in_crop(
-                    bbox,
-                    crop_width,
-                    crop_height,
-                    IMAGE_SIZE.x,
-                    IMAGE_SIZE.y,
-                )
-            )
+            role_batch.append(role_bits)
+            spatial_batch.append(spatial_bits)
 
         pixels_tensor = torch.stack(pixels_batch).to(device)
         keypoints_tensor = torch.stack(keypoints_batch)
         role_tensor = torch.stack(role_batch).to(device)
+        spatial_tensor = torch.stack(spatial_batch).to(device)
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(pixels_tensor, role=role_tensor if USE_ROLE else None)
+            pred_x, pred_y, _aux = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
             coords, joint_conf = decode_simcc(pred_x, pred_y, SIMCC_SPLIT_RATIO)
 
@@ -1123,22 +1732,45 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
         keypoints_np = keypoints_tensor.numpy()
         losses_np = sample_losses.detach().cpu().numpy()
 
-        for offset, (image_path, _keypoints, _bbox, _role) in enumerate(batch):
-            gt = keypoints_np[offset]
-            visible = gt[:, 2] > 0
-            if np.any(visible):
-                score = float(conf_np[offset, visible].mean())
+        for offset, item in enumerate(meta):
+            image_path = item['image_path']
+            video_id = clip_id_from_image_path(image_path)
+            if COUPLE_MODE:
+                for role_name, bank_slice, scale in (
+                    ('lead', slice(0, PERSON_JOINTS), item['lead_scale']),
+                    ('follow', slice(PERSON_JOINTS, 2 * PERSON_JOINTS), item['follow_scale']),
+                ):
+                    gt = keypoints_np[offset, bank_slice]
+                    pred = coords_np[offset, bank_slice]
+                    conf = conf_np[offset, bank_slice]
+                    visible = gt[:, 2] > 0
+                    score = float(conf[visible].mean()) if np.any(visible) else float(conf.mean())
+                    oks = compute_oks(pred, gt, sigmas, scale)
+                    # Per-person loss proxy: half of couple sample loss (same frame).
+                    records.append(
+                        {
+                            'video_id': f'{video_id}:{role_name}',
+                            'oks': oks,
+                            'loss': float(losses_np[offset]) * 0.5,
+                            'score': score,
+                        }
+                    )
             else:
-                score = float(conf_np[offset].mean())
-            oks = compute_oks(coords_np[offset], gt, sigmas, scales[offset])
-            records.append(
-                {
-                    'video_id': clip_id_from_image_path(image_path),
-                    'oks': oks,
-                    'loss': float(losses_np[offset]),
-                    'score': score,
-                }
-            )
+                gt = keypoints_np[offset]
+                visible = gt[:, 2] > 0
+                if np.any(visible):
+                    score = float(conf_np[offset, visible].mean())
+                else:
+                    score = float(conf_np[offset].mean())
+                oks = compute_oks(coords_np[offset], gt, sigmas, item['scale'])
+                records.append(
+                    {
+                        'video_id': video_id,
+                        'oks': oks,
+                        'loss': float(losses_np[offset]),
+                        'score': score,
+                    }
+                )
 
     return summarize_pose_metrics(records)
 
@@ -1189,9 +1821,14 @@ def _run_training(args, config, run_dir, run_config_path):
     annotation_file = get_annotation_file_path(dataset_cfg.annotation_version)
     root = ET.parse(annotation_file).getroot()
     task_ids = [video.get('id') for video in root.findall('./project/videos/video')]
-    full_dataset = KeypointDataset(annotation_file, set(task_ids))
+    if COUPLE_MODE:
+        full_samples = build_couple_samples(annotation_file, set(task_ids), COUPLE_MIN_IOU)
+    else:
+        full_samples = build_person_samples(
+            annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
+        )
     train_samples, test_samples, train_image_paths, test_image_paths = split_samples_by_image(
-        full_dataset.samples,
+        full_samples,
         training_cfg.train_test_split,
         training_cfg.seed,
         split_mode=training_cfg.split_mode,
@@ -1201,14 +1838,15 @@ def _run_training(args, config, run_dir, run_config_path):
     train_clips = sorted({clip_id_from_image_path(path) for path in train_image_paths})
     test_clips = sorted({clip_id_from_image_path(path) for path in test_image_paths})
     split_label = f'{training_cfg.train_test_split:.2f} by {training_cfg.split_mode}'
-    train_dataset = KeypointDataset(
+    dataset_cls = CoupleKeypointDataset if COUPLE_MODE else KeypointDataset
+    train_dataset = dataset_cls(
         annotation_file,
         set(task_ids),
         training=True,
         repeats=training_cfg.augmentation_repeats,
         samples=train_samples,
     )
-    test_dataset = KeypointDataset(
+    test_dataset = dataset_cls(
         annotation_file,
         set(task_ids),
         samples=test_samples,
@@ -1221,11 +1859,16 @@ def _run_training(args, config, run_dir, run_config_path):
     model = build_model(config, device)
     criterion = SimCCLoss().to(device)
 
+    joint_query_heads = (
+        'joint_query_simcc',
+        'joint_query_self_attn_simcc',
+        COUPLE_HEAD_NAME,
+    )
     head_checkpoint_meta = {
         'head_name': head_cfg.name,
         'head_kwargs': (
             build_joint_query_head_kwargs(head_cfg)
-            if head_cfg.name in ('joint_query_simcc', 'joint_query_self_attn_simcc')
+            if head_cfg.name in joint_query_heads
             else build_depthwise_head_kwargs(head_cfg)
             if head_cfg.name == 'depthwise_simcc'
             else {}
@@ -1234,6 +1877,10 @@ def _run_training(args, config, run_dir, run_config_path):
         'split_ratio': SIMCC_SPLIT_RATIO,
         'use_role': USE_ROLE,
         'role_encoding': 'lead_follow_bits',
+        'couple_mode': COUPLE_MODE,
+        'couple_min_iou': COUPLE_MIN_IOU if COUPLE_MODE else None,
+        'max_partner_iou': MAX_PARTNER_IOU,
+        'person_joints': PERSON_JOINTS,
     }
 
 
@@ -1248,12 +1895,23 @@ def _run_training(args, config, run_dir, run_config_path):
     best_val_loss = float('inf')
     epochs_without_improvement = 0
     best_path = run_dir / 'best.pt'
+    couple_msg = (
+        f' couple_mode=True couple_min_iou={COUPLE_MIN_IOU} pair_samples={len(full_samples)}'
+        if COUPLE_MODE
+        else (
+            f' max_partner_iou={MAX_PARTNER_IOU} person_samples={len(full_samples)}'
+            if MAX_PARTNER_IOU is not None
+            else f' person_samples={len(full_samples)}'
+        )
+    )
     print(
         f'Training on {device}; split_mode={training_cfg.split_mode}; '
         f'train images={split_index}/{len(image_paths)}, '
         f'test images={len(image_paths) - split_index}/{len(image_paths)}; '
         f'train clips={train_clips}; test clips={test_clips}; '
-        f'use_role={USE_ROLE} role_dropout={ROLE_DROPOUT if USE_ROLE else 0.0}'
+        f'use_role={USE_ROLE} role_dropout={ROLE_DROPOUT if USE_ROLE else 0.0}; '
+        f'bone_loss_weight={BONE_LOSS_WEIGHT}; '
+        f'num_joints={NUM_JOINTS}{couple_msg}'
     )
 
     for epoch in range(1, training_cfg.max_epochs + 1):
@@ -1269,6 +1927,7 @@ def _run_training(args, config, run_dir, run_config_path):
                 {
                     'model_state_dict': model.state_dict(),
                     'num_joints': NUM_JOINTS,
+                    'person_joints': PERSON_JOINTS,
                     'keypoint_ids': KEYPOINT_IDS,
                     'joint_loss_weights': training_cfg.joint_loss_weights,
                     'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
@@ -1279,6 +1938,9 @@ def _run_training(args, config, run_dir, run_config_path):
                     'split_ratio': head_checkpoint_meta['split_ratio'],
                     'use_role': head_checkpoint_meta['use_role'],
                     'role_encoding': head_checkpoint_meta['role_encoding'],
+                    'couple_mode': head_checkpoint_meta['couple_mode'],
+                    'couple_min_iou': head_checkpoint_meta['couple_min_iou'],
+                    'max_partner_iou': head_checkpoint_meta['max_partner_iou'],
                     'config_path': str(run_config_path),
                     'seed': training_cfg.seed,
                     'split': split_label,
@@ -1298,6 +1960,7 @@ def _run_training(args, config, run_dir, run_config_path):
         {
             'model_state_dict': model.state_dict(),
             'num_joints': NUM_JOINTS,
+            'person_joints': PERSON_JOINTS,
             'keypoint_ids': KEYPOINT_IDS,
             'joint_loss_weights': training_cfg.joint_loss_weights,
             'image_size': (IMAGE_SIZE.x, IMAGE_SIZE.y),
@@ -1308,6 +1971,9 @@ def _run_training(args, config, run_dir, run_config_path):
             'split_ratio': head_checkpoint_meta['split_ratio'],
             'use_role': head_checkpoint_meta['use_role'],
             'role_encoding': head_checkpoint_meta['role_encoding'],
+            'couple_mode': head_checkpoint_meta['couple_mode'],
+            'couple_min_iou': head_checkpoint_meta['couple_min_iou'],
+            'max_partner_iou': head_checkpoint_meta['max_partner_iou'],
             'config_path': str(run_config_path),
             'seed': training_cfg.seed,
             'split': split_label,

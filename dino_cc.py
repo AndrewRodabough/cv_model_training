@@ -156,7 +156,7 @@ class DepthwiseSimCCHead(BaseSimCCHead):
         RoleConditioner(neck_dim, use_film=True) if use_role and role_film else None
     )
 
-  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
+  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None, **kwargs):
     B, _, C = patch_tokens.shape
     x_2d = patch_tokens.permute(0, 2, 1).reshape(
         B, C, self.grid_size.y, self.grid_size.x
@@ -198,8 +198,14 @@ class _JointQueryDecoderLayer(nn.Module):
         nn.Dropout(dropout),
     )
 
-  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-    q = self.norm_q(queries)
+  def forward(
+      self,
+      queries: torch.Tensor,
+      memory: torch.Tensor,
+      cond: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    q_base = self.norm_q(queries)
+    q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
     attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
     queries = queries + attn_out
@@ -236,12 +242,23 @@ class _JointQuerySelfAttnDecoderLayer(nn.Module):
         nn.Dropout(dropout),
     )
 
-  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-    q_self = self.norm_self(queries)
-    self_out, _ = self.self_attn(q_self, q_self, q_self, need_weights=False)
+  def forward(
+      self,
+      queries: torch.Tensor,
+      memory: torch.Tensor,
+      cond: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    q_content = self.norm_self(queries)
+    if cond is not None:
+      q_self = q_content + cond
+      k_self = q_content + cond
+      self_out, _ = self.self_attn(q_self, k_self, q_content, need_weights=False)
+    else:
+      self_out, _ = self.self_attn(q_content, q_content, q_content, need_weights=False)
     queries = queries + self_out
 
-    q = self.norm_q(queries)
+    q_base = self.norm_q(queries)
+    q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
     cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
     queries = queries + cross_out
@@ -277,6 +294,9 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       foot_anchor_pairs: list[tuple[int, int]] | None = None,
       use_role: bool = False,
       role_film: bool = True,
+      per_layer_role_reinject: bool = False,
+      use_spatial_prompt: bool = False,
+      deep_supervision: bool = False,
       **kwargs,
   ):
     super().__init__()
@@ -293,6 +313,9 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.soft_foot_anchor = soft_foot_anchor
     self.use_role = use_role
     self.role_film = role_film
+    self.per_layer_role_reinject = per_layer_role_reinject
+    self.use_spatial_prompt = use_spatial_prompt
+    self.deep_supervision = deep_supervision
     self.out_bins_size = IVec2(
         int(out_size.x * split_ratio), int(out_size.y * split_ratio)
     )
@@ -310,6 +333,19 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.role_conditioner = (
         RoleConditioner(neck_dim, use_film=role_film) if use_role else None
     )
+    if per_layer_role_reinject:
+      self.joint_id_embed = nn.Embedding(num_joints, neck_dim)
+      nn.init.normal_(self.joint_id_embed.weight, std=0.02)
+    else:
+      self.joint_id_embed = None
+    if use_spatial_prompt:
+      self.spatial_mlp = nn.Sequential(
+          nn.Linear(2, neck_dim),
+          nn.GELU(),
+          nn.Linear(neck_dim, neck_dim),
+      )
+    else:
+      self.spatial_mlp = None
 
     if soft_foot_anchor:
       if not foot_anchor_pairs:
@@ -352,7 +388,39 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     queries[:, self.foot_anchor_foot_ids] = foot + gate * self.ankle_to_foot(ankle)
     return queries
 
-  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
+  def _build_layer_cond(
+      self,
+      batch_size: int,
+      role: torch.Tensor | None,
+      spatial: torch.Tensor | None,
+      device,
+      dtype,
+  ) -> torch.Tensor | None:
+    if not self.per_layer_role_reinject and not self.use_spatial_prompt:
+      return None
+    cond = torch.zeros(
+        batch_size, self.num_joints, self.neck_dim, device=device, dtype=dtype
+    )
+    if self.per_layer_role_reinject and self.joint_id_embed is not None:
+      joint_ids = torch.arange(self.num_joints, device=device, dtype=torch.long)
+      cond = cond + self.joint_id_embed(joint_ids).unsqueeze(0)
+      if self.use_role and self.role_conditioner is not None:
+        role = self.role_conditioner.resolve_role(role, batch_size, device, dtype)
+        cond = cond + self.role_conditioner.query_embed(role).unsqueeze(1)
+    if self.use_spatial_prompt and self.spatial_mlp is not None:
+      if spatial is None:
+        spatial = torch.zeros(batch_size, 2, device=device, dtype=dtype)
+      else:
+        spatial = spatial.to(device=device, dtype=dtype)
+      cond = cond + self.spatial_mlp(spatial).unsqueeze(1)
+    return cond
+
+  def forward(
+      self,
+      patch_tokens: torch.Tensor,
+      role: torch.Tensor | None = None,
+      spatial: torch.Tensor | None = None,
+  ):
     B, N, _ = patch_tokens.shape
     expected_n = self.grid_size.x * self.grid_size.y
     if N != expected_n:
@@ -367,8 +435,17 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       queries = self.role_conditioner.bias_queries(queries, role)
       if self.role_conditioner.use_film:
         memory = self.role_conditioner.film_features(memory, role)
+    cond = self._build_layer_cond(B, role, spatial, memory.device, memory.dtype)
+    aux_preds: list[tuple[torch.Tensor, torch.Tensor]] = []
     for layer in self.layers:
-      queries = layer(queries, memory)
+      queries = layer(queries, memory, cond)
+      if self.deep_supervision:
+        aux_preds.append((self.fc_x(queries), self.fc_y(queries)))
+
+    if self.deep_supervision:
+      pred_x, pred_y = aux_preds[-1]
+      early_aux = aux_preds[:-1] if len(aux_preds) > 1 else []
+      return pred_x, pred_y, early_aux
 
     pred_x = self.fc_x(queries)
     pred_y = self.fc_y(queries)
@@ -387,10 +464,83 @@ class JointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
   _layer_cls = _JointQuerySelfAttnDecoderLayer
 
 
+class CoupleJointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
+  """Paired lead|follow joint-query head (2K queries) with person-bank embeddings.
+
+  Query layout: ``[0:K)`` = lead, ``[K:2K)`` = follow. Self-attn across both banks
+  can resolve limb ownership on overlapping union crops. Role conditioning is
+  disabled — bank identity replaces ``[is_lead, is_follow]`` bits.
+  """
+
+  _layer_cls = _JointQuerySelfAttnDecoderLayer
+
+  def __init__(
+      self,
+      in_channels: int,
+      num_joints: int,
+      grid_size: IVec2,
+      out_size: IVec2,
+      split_ratio: float = 2.0,
+      neck_dim: int = 256,
+      num_heads: int = 8,
+      num_layers: int = 2,
+      dropout: float = 0.0,
+      soft_foot_anchor: bool = False,
+      soft_foot_anchor_init: float = 0.4,
+      foot_anchor_pairs: list[tuple[int, int]] | None = None,
+      person_joints: int | None = None,
+      use_role: bool = False,
+      role_film: bool = True,
+      **kwargs,
+  ):
+    if num_joints % 2 != 0:
+      raise ValueError(
+          f'Couple head expects even num_joints (2 * person_joints), got {num_joints}'
+      )
+    resolved_person_joints = (
+        int(person_joints) if person_joints is not None else num_joints // 2
+    )
+    if num_joints != 2 * resolved_person_joints:
+      raise ValueError(
+          f'num_joints ({num_joints}) must equal 2 * person_joints ({resolved_person_joints})'
+      )
+    # Bank embeddings carry identity; never enable role FiLM/bias on this head.
+    super().__init__(
+        in_channels=in_channels,
+        num_joints=num_joints,
+        grid_size=grid_size,
+        out_size=out_size,
+        split_ratio=split_ratio,
+        neck_dim=neck_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dropout=dropout,
+        soft_foot_anchor=soft_foot_anchor,
+        soft_foot_anchor_init=soft_foot_anchor_init,
+        foot_anchor_pairs=foot_anchor_pairs,
+        use_role=False,
+        role_film=False,
+        **kwargs,
+    )
+    self.person_joints = resolved_person_joints
+    self.lead_embed = nn.Parameter(torch.randn(1, 1, neck_dim) * 0.02)
+    self.follow_embed = nn.Parameter(torch.randn(1, 1, neck_dim) * 0.02)
+
+  def _build_queries(self, batch_size: int) -> torch.Tensor:
+    queries = super()._build_queries(batch_size)
+    if not self.soft_foot_anchor:
+      queries = queries.clone()
+    k = self.person_joints
+    queries[:, :k] = queries[:, :k] + self.lead_embed
+    queries[:, k:] = queries[:, k:] + self.follow_embed
+    return queries
+
+
 HEAD_REGISTRY = {
     'depthwise_simcc': DepthwiseSimCCHead,
     'joint_query_simcc': JointQuerySimCCHead,
     'joint_query_self_attn_simcc': JointQuerySelfAttnSimCCHead,
+    'couple_joint_query_self_attn_simcc': CoupleJointQuerySelfAttnSimCCHead,
 }
 
 
@@ -448,7 +598,7 @@ class DinoCC(nn.Module):
         return checkpoint
 
 
-    def forward(self, pixel_values, role=None):
+    def forward(self, pixel_values, role=None, spatial=None):
         # DINOv2 needs pos-encoding interpolation for non-native resolutions; DINOv3 uses RoPE
         if getattr(self.backbone.config, 'model_type', None) == 'dinov2':
             outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
@@ -459,8 +609,10 @@ class DinoCC(nn.Module):
         patch_start = 1 + self.num_register_tokens
         patch_tokens = outputs.last_hidden_state[:, patch_start:, :]  # [B, N, C]
 
-        # Predict 1D coordinates
-        pred_x, pred_y = self.head(patch_tokens, role=role)
+        head_out = self.head(patch_tokens, role=role, spatial=spatial)
+        if isinstance(head_out, tuple) and len(head_out) == 3:
+            return head_out
+        pred_x, pred_y = head_out
         return pred_x, pred_y
 
 

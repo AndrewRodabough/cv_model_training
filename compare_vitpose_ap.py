@@ -476,10 +476,11 @@ def skipped_metrics() -> dict[str, Any]:
 
 def print_comparison(results: dict[str, Any]) -> None:
     print('\n=== Comparison (same test split) ===')
+    ckpt = results.get('checkpoint', 'best.pt')
     order = [
-        ('best_full', 'best.pt (all dance_20)'),
-        ('best_shared', 'best.pt (shared)'),
-        ('best_feet', 'best.pt (feet only)'),
+        ('best_full', f'{ckpt} (all joints)'),
+        ('best_shared', f'{ckpt} (shared)'),
+        ('best_feet', f'{ckpt} (feet only)'),
         ('vitpose_shared', 'VitPose++ (shared, exact bbox)'),
         ('vitpose_feet', 'VitPose++ (feet only, exact bbox)'),
         ('vitpose_shared_jittered', 'VitPose++ (shared, jittered bbox)'),
@@ -515,6 +516,12 @@ def main() -> None:
         type=Path,
         help='Training run folder containing config.yaml and best.pt',
     )
+    parser.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=None,
+        help='Checkpoint to score (default: <run>/best.pt). e.g. final.pt',
+    )
     parser.add_argument('--function-url', default=None)
     parser.add_argument('--function-name', default=DEFAULT_FUNCTION_NAME)
     parser.add_argument('--batch-size', type=int, default=None)
@@ -548,7 +555,11 @@ def main() -> None:
 
     run_dir = Path(args.run)
     config_path = run_dir / 'config.yaml'
-    checkpoint_path = run_dir / 'best.pt'
+    checkpoint_path = args.checkpoint or (run_dir / 'best.pt')
+    if not checkpoint_path.is_absolute():
+        candidate = run_dir / checkpoint_path
+        if candidate.exists():
+            checkpoint_path = candidate
     if not config_path.exists():
         raise FileNotFoundError(f'Missing run config: {config_path}')
     if not checkpoint_path.exists():
@@ -589,8 +600,10 @@ def main() -> None:
 
     training_cfg = config['training']
     dataset_cfg = config['dataset']
+    ckpt_label = checkpoint_path.name
     print(
-        f'Run {run_dir.name} | annotation={dataset_cfg.annotation_version} | '
+        f'Run {run_dir.name} | ckpt={ckpt_label} | '
+        f'annotation={dataset_cfg.annotation_version} | '
         f'split={training_cfg.train_test_split:.2f} {training_cfg.split_mode} | '
         f'seed={training_cfg.seed} | test_samples={len(test_samples)}'
     )
@@ -600,13 +613,13 @@ def main() -> None:
         f'Excluded from shared eval: {", ".join(excluded) if excluded else "(none)"}'
     )
 
-    print('\n[1/6] best.pt — all joints')
+    print(f'\n[1/6] {ckpt_label} — all joints')
     best_full = evaluate_best_pt(
         model, checkpoint_path, test_samples, device, batch_size, joint_indices=None
     )
-    print(format_metrics_summary('best_full', best_full))
+    print(format_metrics_summary('model_full', best_full))
 
-    print('\n[2/6] best.pt — shared joints')
+    print(f'\n[2/6] {ckpt_label} — shared joints')
     best_shared = evaluate_best_pt(
         model,
         checkpoint_path,
@@ -616,9 +629,9 @@ def main() -> None:
         joint_indices=local_ids,
         load_weights=False,
     )
-    print(format_metrics_summary('best_shared', best_shared))
+    print(format_metrics_summary('model_shared', best_shared))
 
-    print('\n[3/6] best.pt — feet only')
+    print(f'\n[3/6] {ckpt_label} — feet only')
     best_feet = evaluate_best_pt(
         model,
         checkpoint_path,
@@ -628,7 +641,7 @@ def main() -> None:
         joint_indices=feet_local_ids,
         load_weights=False,
     )
-    print(format_metrics_summary('best_feet', best_feet))
+    print(format_metrics_summary('model_feet', best_feet))
 
     vitpose_shared = skipped_metrics()
     vitpose_feet = skipped_metrics()
@@ -699,6 +712,7 @@ def main() -> None:
 
     results = {
         'run': str(run_dir),
+        'checkpoint': ckpt_label,
         'annotation_version': dataset_cfg.annotation_version,
         'split_mode': training_cfg.split_mode,
         'train_test_split': training_cfg.train_test_split,
@@ -718,7 +732,8 @@ def main() -> None:
         'jitter_pred_delta': jitter_pred_delta,
     }
 
-    out_dir = run_dir / 'vitpose_compare'
+    out_suffix = '' if ckpt_label == 'best.pt' else f'_{checkpoint_path.stem}'
+    out_dir = run_dir / f'vitpose_compare{out_suffix}'
     out_dir.mkdir(parents=True, exist_ok=True)
     write_metrics_json(results, out_dir / 'metrics.json')
     print_comparison(results)

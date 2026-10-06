@@ -16,6 +16,7 @@ backbone:
 
 head:
   # joint_query_simcc | joint_query_self_attn_simcc | depthwise_simcc
+  # | couple_joint_query_self_attn_simcc (experiment: 46-kpt union-crop pairs)
   name: joint_query_self_attn_simcc
   type: simcc
   keypoint_format_name: dance_23
@@ -37,10 +38,19 @@ head:
     soft_foot_anchor: false
     soft_foot_anchor_init: 0.0
     # Condition head on track role: [is_lead, is_follow]
+    # (ignored for couple_joint_query_self_attn_simcc — use couple_min_iou instead)
     use_role: true
     role_dropout: 0.2
     # false = query bias only (recommended if FiLM flattened peaks)
     role_film: false
+    # Ownership ablations (default off; see config_ownership_ablate.yaml)
+    # per_layer_role_reinject: false
+    # use_spatial_prompt: false
+    # deep_supervision: false
+    # deep_supervision_aux_weight: 0.5
+    # xy_consistency_loss_weight: 0.0
+    # Couple-head only: min lead/follow bbox IoU to keep a pair sample
+    # couple_min_iou: 0.3
 
 training:
   seed: 44
@@ -60,6 +70,8 @@ training:
   aug_color_jitter: 0.25
   worst_test_overlays: 15
   compute_ap: true
+  # Phase A: L1 bone-vector loss on soft-decoded coords (0 = off)
+  # bone_loss_weight: 0.0
   joint_loss_weights:
     shoulder_l: 1.2
     shoulder_r: 1.2
