@@ -49,6 +49,11 @@ head:
     # deep_supervision: false
     # deep_supervision_aux_weight: 0.5
     # xy_consistency_loss_weight: 0.0
+    # Phase B: per-layer joint (x,y) embed (use with deep_supervision)
+    # use_joint_pos_embed: false
+    # L/R structure: shared skeleton pair bias in self-attn
+    # use_pair_bias: false
+    # pair_bias_init: 2.0
     # Couple-head only: min lead/follow bbox IoU to keep a pair sample
     # couple_min_iou: 0.3
 
@@ -72,6 +77,8 @@ training:
   compute_ap: true
   # Phase A: L1 bone-vector loss on soft-decoded coords (0 = off)
   # bone_loss_weight: 0.0
+  # L/R swap assignment penalty (0 = off)
+  # lr_swap_loss_weight: 0.0
   joint_loss_weights:
     shoulder_l: 1.2
     shoulder_r: 1.2

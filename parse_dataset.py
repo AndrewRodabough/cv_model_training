@@ -67,13 +67,19 @@ def discover_annotation_sources(version_dir: Path):
     return without_images, with_images
 
 
-def ingest_images(folder: Path, images_dir: Path, image_store: Path) -> None:
+def ingest_images(
+    folder: Path,
+    images_dir: Path,
+    image_store: Path,
+    project_annotations: Path | None = None,
+) -> None:
     annotations = folder / 'annotations.xml'
     rename_image_store(
         images=images_dir,
         annotations=annotations,
         output=image_store,
         apply=True,
+        project_annotations=project_annotations,
     )
     images_root = folder / 'images'
     if images_root.is_dir():
@@ -199,7 +205,12 @@ def main():
     elif len(without_images) == 1 and len(with_images) >= 1:
         annotations_file = without_images[0] / 'annotations.xml'
         for folder, images_dir in with_images:
-            ingest_images(folder, images_dir, args.images)
+            ingest_images(
+                folder,
+                images_dir,
+                args.images,
+                project_annotations=annotations_file,
+            )
 
     elif len(without_images) > 1:
         paths = ', '.join(str(path / 'annotations.xml') for path in without_images)

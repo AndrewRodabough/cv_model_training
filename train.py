@@ -18,10 +18,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
 from metrics import (
+    body_part_oks_fields,
     compute_oks,
     decode_simcc,
     format_metrics_summary,
+    joint_score_for_visibility,
     person_scale_in_crop,
+    resolve_body_part_indices,
     summarize_pose_metrics,
     write_metrics_json,
 )
@@ -115,6 +118,8 @@ class SimCCConfig:
     use_role: bool = False
     role_dropout: float = 0.1
     role_film: bool = True
+    gaussian_sigma_occluded: float | None = None
+    occluded_joint_weight: float = 0.35
 
 @dataclass
 class JointQuerySimCCConfig:
@@ -122,6 +127,10 @@ class JointQuerySimCCConfig:
     x_bins: int
     y_bins: int
     gaussian_sigma: float
+    # Wider SimCC label for occluded (v==1); None → same as gaussian_sigma
+    gaussian_sigma_occluded: float | None = None
+    # Loss weight for occluded joints (visible always 1.0)
+    occluded_joint_weight: float = 0.35
     num_heads: int = 8
     num_layers: int = 2
     dropout: float = 0.0
@@ -138,6 +147,15 @@ class JointQuerySimCCConfig:
     deep_supervision: bool = False
     deep_supervision_aux_weight: float = 0.5
     xy_consistency_loss_weight: float = 0.0
+    # Phase B: embed soft-decoded joint (x,y) into queries between decoder layers
+    use_joint_pos_embed: bool = False
+    # Learned self-attn bias on skeleton edges; L/R mirror edges share params
+    use_pair_bias: bool = False
+    pair_bias_init: float = 2.0
+    # Soft-decoded joint XY → Gaussian bias on cross-attn over patch grid
+    use_local_cross_attn: bool = False
+    local_attn_sigma: float = 2.0
+    local_attn_strength: float = 2.0
 
 
 @dataclass
@@ -148,6 +166,8 @@ class CoupleJointQuerySimCCConfig:
     x_bins: int
     y_bins: int
     gaussian_sigma: float
+    gaussian_sigma_occluded: float | None = None
+    occluded_joint_weight: float = 0.35
     num_heads: int = 8
     num_layers: int = 2
     dropout: float = 0.0
@@ -172,6 +192,11 @@ class TrainingConfig:
     compute_ap: bool = True
     # frame: random images; stratified_clip: every clip in both sets; clip: whole videos
     split_mode: str = 'frame'
+    # Optional explicit holdout clip ids for split_mode=clip (e.g. ['task_15', 'task_10']).
+    # When set, overrides random train_test_split clip assignment.
+    test_clips: list[str] | None = None
+    # Cap unique frames kept per task/clip (evenly spaced by frame index). None = no cap.
+    max_frames_per_clip: int | None = None
     # Train-time augmentation (applied when KeypointDataset.training=True)
     aug_scale_min: float = 0.85
     aug_scale_max: float = 1.25
@@ -183,6 +208,8 @@ class TrainingConfig:
     max_partner_iou: float | None = None
     # Phase A: weight on L1 bone-vector loss (0 = off). Applied on soft-decoded SimCC coords.
     bone_loss_weight: float = 0.0
+    # Penalize L/R joint assignment when swapped assignment fits GT better (0 = off).
+    lr_swap_loss_weight: float = 0.0
 
 @dataclass
 class keypoint_mapping:
@@ -202,6 +229,8 @@ KEYPOINTS_BY_NAME: dict = {}
 BBOX_PADDING = 0.05
 SIMCC_SPLIT_RATIO = 2.0
 SIMCC_SIGMA = 6.0
+SIMCC_SIGMA_OCCLUDED: float | None = None
+OCCLUDED_JOINT_WEIGHT = 0.35
 LEFT_RIGHT_PAIRS: list[tuple[int, int]] = []
 JOINT_LOSS_WEIGHTS = torch.empty(0)
 OKS_SIGMAS = torch.empty(0)
@@ -224,6 +253,7 @@ DEEP_SUPERVISION = False
 DEEP_SUPERVISION_AUX_WEIGHT = 0.5
 XY_CONSISTENCY_LOSS_WEIGHT = 0.0
 BONE_LOSS_WEIGHT = 0.0
+LR_SWAP_LOSS_WEIGHT = 0.0
 BONE_PAIRS: torch.Tensor = torch.empty(0, 2, dtype=torch.long)
 
 # Directed skeleton edges used for bone-vector loss and overlays (name → name).
@@ -712,11 +742,18 @@ def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
         'per_layer_role_reinject': getattr(custom, 'per_layer_role_reinject', False),
         'use_spatial_prompt': getattr(custom, 'use_spatial_prompt', False),
         'deep_supervision': getattr(custom, 'deep_supervision', False),
+        'use_joint_pos_embed': getattr(custom, 'use_joint_pos_embed', False),
+        'use_pair_bias': getattr(custom, 'use_pair_bias', False),
+        'pair_bias_init': float(getattr(custom, 'pair_bias_init', 2.0)),
+        'use_local_cross_attn': getattr(custom, 'use_local_cross_attn', False),
+        'local_attn_sigma': float(getattr(custom, 'local_attn_sigma', 2.0)),
+        'local_attn_strength': float(getattr(custom, 'local_attn_strength', 2.0)),
     }
     if head_cfg.name == COUPLE_HEAD_NAME:
         kwargs['person_joints'] = PERSON_JOINTS
         kwargs['use_role'] = False
         kwargs['role_film'] = False
+        kwargs['use_pair_bias'] = False
         if custom.soft_foot_anchor:
             kwargs['foot_anchor_pairs'] = build_couple_foot_anchor_pairs(head_cfg.keypoints)
     else:
@@ -724,6 +761,11 @@ def build_joint_query_head_kwargs(head_cfg: HeadConfig) -> dict:
         kwargs['role_film'] = custom.role_film
         if custom.soft_foot_anchor:
             kwargs['foot_anchor_pairs'] = build_foot_anchor_pairs(head_cfg.keypoints)
+        if kwargs['use_pair_bias']:
+            kwargs['pair_bias_bones'] = build_bone_index_pairs(head_cfg.keypoints)
+            kwargs['pair_bias_lr_pairs'] = build_left_right_index_pairs(
+                head_cfg.left_right_pairs, head_cfg.keypoints
+            )
     return kwargs
 
 
@@ -750,12 +792,13 @@ def build_oks_sigmas(oks_sigmas: dict[str, float] | None, keypoints_by_name: dic
 def setup_from_config(config):
     """Apply image / SimCC / keypoint globals from the parsed config."""
     global IMAGE_SIZE, KEYPOINT_IDS, KEYPOINT_INDEX, NUM_JOINTS, PERSON_JOINTS, KEYPOINTS_BY_NAME
-    global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA
+    global BBOX_PADDING, SIMCC_SPLIT_RATIO, SIMCC_SIGMA, SIMCC_SIGMA_OCCLUDED
+    global OCCLUDED_JOINT_WEIGHT
     global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS, OKS_SIGMAS
     global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
     global USE_ROLE, ROLE_DROPOUT, COUPLE_MODE, COUPLE_MIN_IOU, MAX_PARTNER_IOU
     global USE_SPATIAL_PROMPT, DEEP_SUPERVISION, DEEP_SUPERVISION_AUX_WEIGHT
-    global XY_CONSISTENCY_LOSS_WEIGHT, BONE_LOSS_WEIGHT, BONE_PAIRS
+    global XY_CONSISTENCY_LOSS_WEIGHT, BONE_LOSS_WEIGHT, LR_SWAP_LOSS_WEIGHT, BONE_PAIRS
 
     image_cfg: ImageConfig = config['image']
     head_cfg: HeadConfig = config['head']
@@ -843,6 +886,9 @@ def setup_from_config(config):
     BONE_LOSS_WEIGHT = float(getattr(training_cfg, 'bone_loss_weight', 0.0))
     if BONE_LOSS_WEIGHT < 0:
         raise ValueError(f'bone_loss_weight must be >= 0, got {BONE_LOSS_WEIGHT}')
+    LR_SWAP_LOSS_WEIGHT = float(getattr(training_cfg, 'lr_swap_loss_weight', 0.0))
+    if LR_SWAP_LOSS_WEIGHT < 0:
+        raise ValueError(f'lr_swap_loss_weight must be >= 0, got {LR_SWAP_LOSS_WEIGHT}')
 
     ordered = sorted(head_cfg.keypoints.items(), key=lambda item: item[1]['id'])
     local_ids = [meta['id'] for _, meta in ordered]
@@ -859,7 +905,18 @@ def setup_from_config(config):
     if head_cfg.type == 'simcc':
         simcc = head_cfg.custom
         SIMCC_SPLIT_RATIO = simcc.split_ratio
-        SIMCC_SIGMA = simcc.gaussian_sigma
+        SIMCC_SIGMA = float(simcc.gaussian_sigma)
+        occ = getattr(simcc, 'gaussian_sigma_occluded', None)
+        SIMCC_SIGMA_OCCLUDED = float(occ) if occ is not None else None
+        if SIMCC_SIGMA_OCCLUDED is not None and SIMCC_SIGMA_OCCLUDED <= 0:
+            raise ValueError(
+                f'gaussian_sigma_occluded must be > 0, got {SIMCC_SIGMA_OCCLUDED}'
+            )
+        OCCLUDED_JOINT_WEIGHT = float(getattr(simcc, 'occluded_joint_weight', 0.35))
+        if not 0.0 < OCCLUDED_JOINT_WEIGHT <= 1.0:
+            raise ValueError(
+                f'occluded_joint_weight must be in (0, 1], got {OCCLUDED_JOINT_WEIGHT}'
+            )
         expected_x = int(image_cfg.width * simcc.split_ratio)
         expected_y = int(image_cfg.height * simcc.split_ratio)
         if simcc.x_bins != expected_x or simcc.y_bins != expected_y:
@@ -965,6 +1022,74 @@ def clip_id_from_image_path(image_path) -> str:
     return str(Path(image_path).parent)
 
 
+def _frame_index_from_image_path(image_path) -> int:
+    name = Path(image_path).name
+    if '_frame_' in name:
+        stem = name.rsplit('.', 1)[0]
+        suffix = stem.split('_frame_', 1)[-1]
+        if suffix.isdigit():
+            return int(suffix)
+    return 0
+
+
+def cap_samples_per_clip(samples, max_frames_per_clip: int | None, seed: int):
+    """Keep at most ``max_frames_per_clip`` unique images per task/clip.
+
+    When a clip exceeds the cap, frames are chosen evenly along sorted frame
+    index (deterministic; ``seed`` reserved for future random modes).
+    """
+    if max_frames_per_clip is None:
+        return samples
+    if max_frames_per_clip < 1:
+        raise ValueError(f'max_frames_per_clip must be >= 1, got {max_frames_per_clip}')
+
+    by_clip: dict[str, dict] = {}
+    order: list[str] = []
+    for sample in samples:
+        image_path = sample[0]
+        clip_id = clip_id_from_image_path(image_path)
+        if clip_id not in by_clip:
+            by_clip[clip_id] = {}
+            order.append(clip_id)
+        by_clip[clip_id].setdefault(image_path, []).append(sample)
+
+    kept = []
+    dropped_frames = 0
+    for clip_id in order:
+        image_map = by_clip[clip_id]
+        paths = sorted(image_map, key=_frame_index_from_image_path)
+        if len(paths) <= max_frames_per_clip:
+            selected = paths
+        else:
+            # Evenly spaced indices over [0, n-1], inclusive endpoints.
+            n = len(paths)
+            idxs = sorted(
+                {
+                    int(round(i * (n - 1) / (max_frames_per_clip - 1)))
+                    for i in range(max_frames_per_clip)
+                }
+            )
+            # If rounding collapsed duplicates, fill gaps from unused frames.
+            if len(idxs) < max_frames_per_clip:
+                unused = [j for j in range(n) if j not in idxs]
+                need = max_frames_per_clip - len(idxs)
+                idxs = sorted(idxs + unused[:need])
+            selected = [paths[j] for j in idxs]
+            dropped_frames += n - len(selected)
+        for path in selected:
+            kept.extend(image_map[path])
+
+    if dropped_frames:
+        print(
+            f'max_frames_per_clip={max_frames_per_clip}: '
+            f'dropped {dropped_frames} frames; '
+            f'kept {sum(1 for _ in {s[0] for s in kept})}/'
+            f'{sum(1 for _ in {s[0] for s in samples})} images, '
+            f'{len(kept)}/{len(samples)} person-samples'
+        )
+    return kept
+
+
 def split_image_paths(image_paths, train_ratio, seed):
     paths = list(image_paths)
     rng = random.Random(seed)
@@ -977,13 +1102,26 @@ def split_image_paths(image_paths, train_ratio, seed):
     return paths[:split_index], paths[split_index:]
 
 
-def split_samples_by_image(samples, train_ratio, seed, split_mode='frame'):
+def _normalize_clip_id(clip_id: str) -> str:
+    text = str(clip_id).strip()
+    if text.isdigit():
+        return f'task_{text}'
+    if text.startswith('task_'):
+        return text
+    return text
+
+
+def split_samples_by_image(
+    samples, train_ratio, seed, split_mode='frame', test_clips=None
+):
     """Split person-samples into train/test.
 
     Modes:
       - frame: shuffle unique images globally (legacy).
       - stratified_clip: within each task/clip, split images by ratio (every clip appears in train).
       - clip: assign whole clips to train or test.
+        If ``test_clips`` is set, those clips are held out and the rest train
+        (``train_ratio`` is ignored for assignment).
     """
     image_groups: dict = {}
     for sample in samples:
@@ -1021,13 +1159,27 @@ def split_samples_by_image(samples, train_ratio, seed, split_mode='frame'):
         clip_ids = list(clip_to_images)
         if len(clip_ids) < 2:
             raise ValueError('split_mode=clip requires at least 2 clips')
-        rng = random.Random(seed)
-        rng.shuffle(clip_ids)
-        split_index = max(1, min(len(clip_ids) - 1, round(len(clip_ids) * train_ratio)))
-        train_clips = set(clip_ids[:split_index])
-        test_clips = set(clip_ids[split_index:])
-        train_paths = [path for clip_id in train_clips for path in clip_to_images[clip_id]]
-        test_paths = [path for clip_id in test_clips for path in clip_to_images[clip_id]]
+        if test_clips:
+            wanted = {_normalize_clip_id(c) for c in test_clips}
+            available = set(clip_ids)
+            missing = sorted(wanted - available)
+            if missing:
+                raise ValueError(
+                    f'test_clips not found in dataset: {missing}; available={sorted(available)}'
+                )
+            if wanted == available:
+                raise ValueError('test_clips cannot include every clip')
+            test_clip_set = wanted
+            train_clip_set = available - wanted
+        else:
+            rng = random.Random(seed)
+            shuffled = list(clip_ids)
+            rng.shuffle(shuffled)
+            split_index = max(1, min(len(shuffled) - 1, round(len(shuffled) * train_ratio)))
+            train_clip_set = set(shuffled[:split_index])
+            test_clip_set = set(shuffled[split_index:])
+        train_paths = [path for clip_id in train_clip_set for path in clip_to_images[clip_id]]
+        test_paths = [path for clip_id in test_clip_set for path in clip_to_images[clip_id]]
     else:
         raise ValueError(
             f"Unsupported split_mode={split_mode!r}; expected 'frame', 'stratified_clip', or 'clip'"
@@ -1040,7 +1192,14 @@ def split_samples_by_image(samples, train_ratio, seed, split_mode='frame'):
 
 def make_targets(keypoints, device):
     targets = [
-        generate_simcc_labels(sample.numpy(), IMAGE_SIZE, split_ratio=SIMCC_SPLIT_RATIO, sigma=SIMCC_SIGMA)
+        generate_simcc_labels(
+            sample.numpy(),
+            IMAGE_SIZE,
+            split_ratio=SIMCC_SPLIT_RATIO,
+            sigma=SIMCC_SIGMA,
+            sigma_occluded=SIMCC_SIGMA_OCCLUDED,
+            occluded_weight=OCCLUDED_JOINT_WEIGHT,
+        )
         for sample in keypoints
     ]
     target_x, target_y, weights = zip(*targets)
@@ -1108,6 +1267,37 @@ def bone_vector_loss(
     return (err * valid).sum() / (valid.sum() + 1e-6)
 
 
+def lr_swap_assignment_loss(
+    pred_xy: torch.Tensor,
+    gt_keypoints: torch.Tensor,
+    left_right_pairs: list[tuple[int, int]],
+) -> torch.Tensor:
+    """Penalize when swapped L/R assignment fits GT better than the correct one."""
+    if not left_right_pairs:
+        return pred_xy.new_zeros(())
+    gt_xy = gt_keypoints[..., :2].to(device=pred_xy.device, dtype=pred_xy.dtype)
+    vis = gt_keypoints[..., 2].to(device=pred_xy.device)
+    diag = (IMAGE_SIZE.x ** 2 + IMAGE_SIZE.y ** 2) ** 0.5
+    scale = max(float(diag), 1e-6)
+    losses = []
+    for left_i, right_i in left_right_pairs:
+        valid = (vis[:, left_i] > 0) & (vis[:, right_i] > 0)
+        if not bool(valid.any()):
+            continue
+        pred_l = pred_xy[:, left_i]
+        pred_r = pred_xy[:, right_i]
+        gt_l = gt_xy[:, left_i]
+        gt_r = gt_xy[:, right_i]
+        d_correct = (pred_l - gt_l).abs().sum(dim=-1) + (pred_r - gt_r).abs().sum(dim=-1)
+        d_swapped = (pred_l - gt_r).abs().sum(dim=-1) + (pred_r - gt_l).abs().sum(dim=-1)
+        # softplus(d_correct - d_swapped): large when swap fits better
+        pair_loss = torch.nn.functional.softplus((d_correct - d_swapped) / scale)
+        losses.append(pair_loss[valid].mean())
+    if not losses:
+        return pred_xy.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def simcc_xy_consistency_loss(pred_x, pred_y, target_x, target_y, weights):
     """KL between factored pred marginals and factored GT SimCC (outer product)."""
     px = torch.nn.functional.softmax(pred_x, dim=-1)
@@ -1145,6 +1335,15 @@ def compute_simcc_training_loss(
         loss = loss + BONE_LOSS_WEIGHT * bone_vector_loss(
             pred_xy, gt_keypoints, BONE_PAIRS
         )
+        if LR_SWAP_LOSS_WEIGHT > 0:
+            loss = loss + LR_SWAP_LOSS_WEIGHT * lr_swap_assignment_loss(
+                pred_xy, gt_keypoints, LEFT_RIGHT_PAIRS
+            )
+    elif LR_SWAP_LOSS_WEIGHT > 0 and gt_keypoints is not None:
+        pred_xy = soft_decode_simcc_coords(pred_x, pred_y, SIMCC_SPLIT_RATIO)
+        loss = loss + LR_SWAP_LOSS_WEIGHT * lr_swap_assignment_loss(
+            pred_xy, gt_keypoints, LEFT_RIGHT_PAIRS
+        )
     return loss
 
 
@@ -1159,7 +1358,9 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, training, gra
         role = maybe_drop_role(role, training)
         target_x, target_y, weights = make_targets(keypoints, device)
         gt_keypoints = (
-            keypoints.to(device, non_blocking=True) if BONE_LOSS_WEIGHT > 0 else None
+            keypoints.to(device, non_blocking=True)
+            if (BONE_LOSS_WEIGHT > 0 or LR_SWAP_LOSS_WEIGHT > 0)
+            else None
         )
 
         if training:
@@ -1362,11 +1563,17 @@ def load_test_samples(config):
         full_samples = build_person_samples(
             annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
         )
+    full_samples = cap_samples_per_clip(
+        full_samples,
+        getattr(training_cfg, 'max_frames_per_clip', None),
+        training_cfg.seed,
+    )
     _, test_samples, _, _ = split_samples_by_image(
         full_samples,
         training_cfg.train_test_split,
         training_cfg.seed,
         split_mode=training_cfg.split_mode,
+        test_clips=getattr(training_cfg, 'test_clips', None),
     )
     return test_samples
 
@@ -1618,8 +1825,15 @@ def export_worst_test_overlays(model, checkpoint_path, test_samples, output_dir,
 
 
 @torch.inference_mode()
-def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, batch_size):
-    """Score best/final checkpoint with OKS-AP (primary) and SimCC loss (secondary)."""
+def evaluate_checkpoint_metrics(
+    model,
+    checkpoint_path,
+    test_samples,
+    device,
+    batch_size,
+    annotation_version: str | None = None,
+):
+    """Score best/final checkpoint with OKS-AP (primary) and custom suites."""
     if OKS_SIGMAS.numel() == 0:
         raise ValueError('OKS_SIGMAS is empty; keypoint format must define oks_sigmas')
 
@@ -1628,7 +1842,19 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
     model.eval()
 
     sigmas = OKS_SIGMAS.detach().cpu().numpy()
+    part_indices = resolve_body_part_indices(KEYPOINTS_BY_NAME)
     records = []
+    ownership_records: list[dict[str, Any]] = []
+
+    frame_index = None
+    if not COUPLE_MODE and annotation_version:
+        # Lazy import avoids train <-> eval_ownership cycle at module load.
+        from eval_ownership import build_frame_index
+
+        annotation_file = get_annotation_file_path(annotation_version)
+        root = ET.parse(annotation_file).getroot()
+        task_ids = {video.get('id') for video in root.findall('./project/videos/video')}
+        frame_index = build_frame_index(annotation_file, task_ids)
 
     for start in range(0, len(test_samples), batch_size):
         batch = test_samples[start:start + batch_size]
@@ -1701,6 +1927,10 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
                 meta.append(
                     {
                         'image_path': image_path,
+                        'bbox': bbox,
+                        'role': role,
+                        'crop_kps': crop_keypoints,
+                        'crop_geom': (crop_x1, crop_y1, crop_width, crop_height),
                         'scale': person_scale_in_crop(
                             bbox,
                             crop_width,
@@ -1731,6 +1961,8 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
         conf_np = joint_conf.detach().cpu().numpy()
         keypoints_np = keypoints_tensor.numpy()
         losses_np = sample_losses.detach().cpu().numpy()
+        pred_x_np = pred_x.detach().float().cpu().numpy()
+        pred_y_np = pred_y.detach().float().cpu().numpy()
 
         for offset, item in enumerate(meta):
             image_path = item['image_path']
@@ -1743,41 +1975,171 @@ def evaluate_checkpoint_metrics(model, checkpoint_path, test_samples, device, ba
                     gt = keypoints_np[offset, bank_slice]
                     pred = coords_np[offset, bank_slice]
                     conf = conf_np[offset, bank_slice]
-                    visible = gt[:, 2] > 0
-                    score = float(conf[visible].mean()) if np.any(visible) else float(conf.mean())
-                    oks = compute_oks(pred, gt, sigmas, scale)
-                    # Per-person loss proxy: half of couple sample loss (same frame).
                     records.append(
-                        {
-                            'video_id': f'{video_id}:{role_name}',
-                            'oks': oks,
-                            'loss': float(losses_np[offset]) * 0.5,
-                            'score': score,
-                        }
+                        _pose_metric_record(
+                            video_id=f'{video_id}:{role_name}',
+                            pred=pred,
+                            gt=gt,
+                            conf=conf,
+                            sigmas=sigmas,
+                            scale=scale,
+                            loss=float(losses_np[offset]) * 0.5,
+                            part_indices=part_indices,
+                        )
                     )
             else:
                 gt = keypoints_np[offset]
-                visible = gt[:, 2] > 0
-                if np.any(visible):
-                    score = float(conf_np[offset, visible].mean())
-                else:
-                    score = float(conf_np[offset].mean())
-                oks = compute_oks(coords_np[offset], gt, sigmas, item['scale'])
                 records.append(
-                    {
-                        'video_id': video_id,
-                        'oks': oks,
-                        'loss': float(losses_np[offset]),
-                        'score': score,
-                    }
+                    _pose_metric_record(
+                        video_id=video_id,
+                        pred=coords_np[offset],
+                        gt=gt,
+                        conf=conf_np[offset],
+                        sigmas=sigmas,
+                        scale=item['scale'],
+                        loss=float(losses_np[offset]),
+                        part_indices=part_indices,
+                    )
                 )
+                if frame_index is not None:
+                    ownership_records.append(
+                        _ownership_metric_record(
+                            item=item,
+                            pred_xy=coords_np[offset],
+                            pred_x=pred_x_np[offset],
+                            pred_y=pred_y_np[offset],
+                            sigmas=sigmas,
+                            frame_index=frame_index,
+                        )
+                    )
 
-    return summarize_pose_metrics(records)
+    ownership_summary = None
+    if ownership_records:
+        from ownership_metrics import summarize_ownership_records
+
+        ownership_summary = summarize_ownership_records(ownership_records)
+
+    return summarize_pose_metrics(records, ownership=ownership_summary)
 
 
-def export_checkpoint_metrics(model, checkpoint_path, test_samples, output_dir, device, batch_size):
+def _pose_metric_record(
+    video_id: str,
+    pred: np.ndarray,
+    gt: np.ndarray,
+    conf: np.ndarray,
+    sigmas: np.ndarray,
+    scale: float,
+    loss: float,
+    part_indices: dict[str, list[int]] | None = None,
+) -> dict[str, Any]:
+    """Primary OKS-AP fields plus visibility-split / body-part OKS for custom metrics."""
+    n_visible = int(np.sum(gt[:, 2] == 2))
+    n_occluded = int(np.sum(gt[:, 2] == 1))
+    record = {
+        'video_id': video_id,
+        'oks': compute_oks(pred, gt, sigmas, scale),
+        'loss': loss,
+        'score': joint_score_for_visibility(conf, gt),
+        'oks_visible': compute_oks(pred, gt, sigmas, scale, visibility_eq=2),
+        'score_visible': joint_score_for_visibility(conf, gt, visibility_eq=2),
+        'n_visible': n_visible,
+        'oks_occluded': compute_oks(pred, gt, sigmas, scale, visibility_eq=1),
+        'score_occluded': joint_score_for_visibility(conf, gt, visibility_eq=1),
+        'n_occluded': n_occluded,
+    }
+    if part_indices:
+        record['parts'] = body_part_oks_fields(
+            pred, gt, conf, sigmas, scale, part_indices
+        )
+    return record
+
+
+def _ownership_metric_record(
+    item: dict[str, Any],
+    pred_xy: np.ndarray,
+    pred_x: np.ndarray,
+    pred_y: np.ndarray,
+    sigmas: np.ndarray,
+    frame_index: dict,
+    swap_partner_oks_floor: float = 0.25,
+    collapse_self_tau: float = 0.5,
+) -> dict[str, Any]:
+    """One-sample swap / collapse / xy-mix record (same defs as eval_ownership)."""
+    from eval_ownership import is_same_person
+    from ownership_metrics import iou_bucket, joint_xy_mix_fraction, pick_partner
+
+    image_path = Path(item['image_path'])
+    self_bbox = item['bbox']
+    people = frame_index.get(image_path, [])
+    others = [
+        (kps, bbox, role)
+        for kps, bbox, role in people
+        if not is_same_person(bbox, self_bbox)
+    ]
+    crop_kps = item['crop_kps']
+    oks_self = compute_oks(pred_xy, crop_kps, sigmas, item['scale'])
+    partner_ctx = pick_partner(self_bbox, others)
+    if partner_ctx is None:
+        return {
+            'image_path': str(image_path),
+            'role': item['role'],
+            'iou_bucket': iou_bucket(0.0),
+            'max_partner_iou': 0.0,
+            'has_partner': False,
+            'swap': False,
+            'collapse': False,
+            'oks_self': float(oks_self) if oks_self is not None else 0.0,
+            'oks_partner': 0.0,
+            'xy_mix_rate': 0.0,
+            'xy_mix_joints': 0,
+        }
+
+    cx1, cy1, cw, ch = item['crop_geom']
+    partner_crop = transform_keypoints_to_crop(
+        partner_ctx.partner_kps, cx1, cy1, cw, ch
+    )
+    partner_scale = person_scale_in_crop(
+        partner_ctx.partner_bbox, cw, ch, IMAGE_SIZE.x, IMAGE_SIZE.y
+    )
+    oks_partner = compute_oks(pred_xy, partner_crop, sigmas, partner_scale)
+    oks_self_f = float(oks_self) if oks_self is not None else 0.0
+    oks_partner_f = float(oks_partner) if oks_partner is not None else 0.0
+    swap = oks_partner_f > oks_self_f and oks_partner_f >= swap_partner_oks_floor
+    collapse = oks_self_f < collapse_self_tau and oks_partner_f > oks_self_f
+    xy_mix_rate, xy_n = joint_xy_mix_fraction(
+        pred_x, pred_y, crop_kps, partner_crop, SIMCC_SPLIT_RATIO
+    )
+    return {
+        'image_path': str(image_path),
+        'role': item['role'],
+        'iou_bucket': iou_bucket(partner_ctx.max_partner_iou),
+        'max_partner_iou': partner_ctx.max_partner_iou,
+        'has_partner': True,
+        'swap': bool(swap),
+        'collapse': bool(collapse),
+        'oks_self': oks_self_f,
+        'oks_partner': oks_partner_f,
+        'xy_mix_rate': float(xy_mix_rate),
+        'xy_mix_joints': int(xy_n),
+    }
+
+
+def export_checkpoint_metrics(
+    model,
+    checkpoint_path,
+    test_samples,
+    output_dir,
+    device,
+    batch_size,
+    annotation_version: str | None = None,
+):
     metrics = evaluate_checkpoint_metrics(
-        model, checkpoint_path, test_samples, device, batch_size
+        model,
+        checkpoint_path,
+        test_samples,
+        device,
+        batch_size,
+        annotation_version=annotation_version,
     )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1790,6 +2152,11 @@ def main():
     parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
     parser.add_argument('--config', default='config.yaml')
     parser.add_argument('--workers', type=int, default=6)
+    parser.add_argument(
+        '--init-checkpoint',
+        default=None,
+        help='Load model weights from this .pt (fresh optimizer; for continued training).',
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -1827,11 +2194,17 @@ def _run_training(args, config, run_dir, run_config_path):
         full_samples = build_person_samples(
             annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
         )
+    full_samples = cap_samples_per_clip(
+        full_samples,
+        getattr(training_cfg, 'max_frames_per_clip', None),
+        training_cfg.seed,
+    )
     train_samples, test_samples, train_image_paths, test_image_paths = split_samples_by_image(
         full_samples,
         training_cfg.train_test_split,
         training_cfg.seed,
         split_mode=training_cfg.split_mode,
+        test_clips=getattr(training_cfg, 'test_clips', None),
     )
     split_index = len(train_image_paths)
     image_paths = train_image_paths + test_image_paths
@@ -1857,6 +2230,16 @@ def _run_training(args, config, run_dir, run_config_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = build_model(config, device)
+    if getattr(args, 'init_checkpoint', None):
+        init_path = Path(args.init_checkpoint).resolve()
+        if not init_path.is_file():
+            raise FileNotFoundError(f'--init-checkpoint not found: {init_path}')
+        ckpt = torch.load(init_path, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        print(
+            f'Loaded init checkpoint {init_path} '
+            f'(epoch={ckpt.get("epoch", "?")}; missing={len(missing)} unexpected={len(unexpected)})'
+        )
     criterion = SimCCLoss().to(device)
 
     joint_query_heads = (
@@ -1904,6 +2287,11 @@ def _run_training(args, config, run_dir, run_config_path):
             else f' person_samples={len(full_samples)}'
         )
     )
+    init_msg = (
+        f'; init_checkpoint={Path(args.init_checkpoint).resolve()}'
+        if getattr(args, 'init_checkpoint', None)
+        else ''
+    )
     print(
         f'Training on {device}; split_mode={training_cfg.split_mode}; '
         f'train images={split_index}/{len(image_paths)}, '
@@ -1911,7 +2299,12 @@ def _run_training(args, config, run_dir, run_config_path):
         f'train clips={train_clips}; test clips={test_clips}; '
         f'use_role={USE_ROLE} role_dropout={ROLE_DROPOUT if USE_ROLE else 0.0}; '
         f'bone_loss_weight={BONE_LOSS_WEIGHT}; '
-        f'num_joints={NUM_JOINTS}{couple_msg}'
+        f'lr_swap_loss_weight={LR_SWAP_LOSS_WEIGHT}; '
+        f'lr={training_cfg.learning_rate}; '
+        f'simcc_sigma={SIMCC_SIGMA}'
+        f'{"" if SIMCC_SIGMA_OCCLUDED is None else f"/{SIMCC_SIGMA_OCCLUDED}_occ"}; '
+        f'occ_weight={OCCLUDED_JOINT_WEIGHT}; '
+        f'num_joints={NUM_JOINTS}{couple_msg}{init_msg}'
     )
 
     for epoch in range(1, training_cfg.max_epochs + 1):
@@ -2022,6 +2415,7 @@ def _run_training(args, config, run_dir, run_config_path):
                 output_dir=run_dir / checkpoint_name,
                 device=device,
                 batch_size=training_cfg.batch_size,
+                annotation_version=dataset_cfg.annotation_version,
             )
 
 

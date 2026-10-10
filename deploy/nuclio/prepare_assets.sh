@@ -18,11 +18,15 @@ fi
 echo "Syncing model code from repo root..."
 cp -f "${ROOT}/dino_cc.py" "${DEST}/dino_cc.py"
 cp -f "${ROOT}/vec.py" "${DEST}/vec.py"
-cp -f "${ROOT}/mapping/dance_20.yaml" "${DEST}/mapping/dance_20.yaml"
+cp -f "${ROOT}/mapping/dance_23.yaml" "${DEST}/mapping/dance_23.yaml"
 
 mkdir -p "${DEST}/weights" "${DEST}/backbone"
 echo "Copying checkpoint: ${CHECKPOINT}"
-cp -f "${CHECKPOINT}" "${DEST}/weights/best.pt"
+CHECKPOINT_ABS="$(cd "$(dirname "${CHECKPOINT}")" && pwd)/$(basename "${CHECKPOINT}")"
+DEST_CKPT="${DEST}/weights/best.pt"
+if [[ "${CHECKPOINT_ABS}" != "${DEST_CKPT}" ]]; then
+  cp -f "${CHECKPOINT}" "${DEST_CKPT}"
+fi
 
 BACKBONE_ID="$(
   python3 - "${CHECKPOINT}" <<'PY'

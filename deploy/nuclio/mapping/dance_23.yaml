@@ -1,5 +1,5 @@
-name: dance_20
-num_keypoints: 20
+name: dance_23
+num_keypoints: 23
 keypoints:
   wrist_l:
     id: 0
@@ -61,6 +61,15 @@ keypoints:
   heel_spike_r:
     id: 19
     standard_id: 30
+  ear_l:
+    id: 20
+    standard_id: 3
+  ear_r:
+    id: 21
+    standard_id: 4
+  glabella:
+    id: 22
+    standard_id: 17
 left_right_pairs:
   - [wrist_l, wrist_r]
   - [shoulder_l, shoulder_r]
@@ -72,6 +81,7 @@ left_right_pairs:
   - [toe_s_l, toe_s_r]
   - [heel_l, heel_r]
   - [heel_spike_l, heel_spike_r]
+  - [ear_l, ear_r]
 # COCO-style OKS sigmas (fraction of person scale). Foot tips use ankle-like values.
 oks_sigmas:
   shoulder_l: 0.079
@@ -94,3 +104,7 @@ oks_sigmas:
   heel_r: 0.089
   heel_spike_l: 0.089
   heel_spike_r: 0.089
+  ear_l: 0.035
+  ear_r: 0.035
+  glabella: 0.026
+  

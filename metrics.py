@@ -14,6 +14,43 @@ import torch.nn.functional as F
 
 OKS_THRESHOLDS = np.arange(0.50, 1.00, 0.05)
 
+# Local joint-name groups for dance_23-style formats (resolved via keypoint map).
+BODY_PART_JOINT_NAMES: dict[str, tuple[str, ...]] = {
+    'head': ('ear_l', 'ear_r', 'glabella'),
+    'arms': (
+        'shoulder_l',
+        'shoulder_r',
+        'elbow_l',
+        'elbow_r',
+        'wrist_l',
+        'wrist_r',
+    ),
+    'legs': ('hip_l', 'hip_r', 'knee_l', 'knee_r', 'ankle_l', 'ankle_r'),
+    'feet': (
+        'toe_b_l',
+        'toe_s_l',
+        'heel_l',
+        'heel_spike_l',
+        'toe_b_r',
+        'toe_s_r',
+        'heel_r',
+        'heel_spike_r',
+    ),
+}
+
+
+def resolve_body_part_indices(keypoints_by_name: dict) -> dict[str, list[int]]:
+    """Map body-part groups to local joint ids present in the active format."""
+    resolved: dict[str, list[int]] = {}
+    for part, names in BODY_PART_JOINT_NAMES.items():
+        ids = [
+            int(keypoints_by_name[name]['id'])
+            for name in names
+            if name in keypoints_by_name
+        ]
+        resolved[part] = ids
+    return resolved
+
 
 def decode_simcc(
     pred_x: torch.Tensor,
@@ -59,15 +96,72 @@ def compute_oks(
     gt_xyv: np.ndarray,
     sigmas: np.ndarray,
     scale: float,
-) -> float:
-    """Object Keypoint Similarity for one person (visibility > 0 joints only)."""
-    visible = gt_xyv[:, 2] > 0
-    if not np.any(visible):
-        return 0.0
-    delta = pred_xy[visible] - gt_xyv[visible, :2]
+    visibility_eq: int | None = None,
+) -> float | None:
+    """Object Keypoint Similarity for one person.
+
+    Args:
+        visibility_eq: If None, use all labeled joints (v > 0). If 1 or 2, restrict
+            to occluded or visible joints only. Returns None when the person has no
+            joints in the selected class (caller should omit from AP).
+    """
+    if visibility_eq is None:
+        mask = gt_xyv[:, 2] > 0
+    else:
+        mask = gt_xyv[:, 2] == visibility_eq
+    if not np.any(mask):
+        return None if visibility_eq is not None else 0.0
+    delta = pred_xy[mask] - gt_xyv[mask, :2]
     dist_sq = np.sum(delta * delta, axis=-1)
-    denom = 2.0 * (scale ** 2) * (sigmas[visible] ** 2) + 1e-9
+    denom = 2.0 * (scale ** 2) * (sigmas[mask] ** 2) + 1e-9
     return float(np.exp(-dist_sq / denom).mean())
+
+
+def joint_score_for_visibility(
+    joint_conf: np.ndarray,
+    gt_xyv: np.ndarray,
+    visibility_eq: int | None = None,
+) -> float:
+    """Mean SimCC confidence over joints in the visibility class (fallback: all)."""
+    if visibility_eq is None:
+        mask = gt_xyv[:, 2] > 0
+    else:
+        mask = gt_xyv[:, 2] == visibility_eq
+    if np.any(mask):
+        return float(joint_conf[mask].mean())
+    return float(joint_conf.mean())
+
+
+def body_part_oks_fields(
+    pred_xy: np.ndarray,
+    gt_xyv: np.ndarray,
+    joint_conf: np.ndarray,
+    sigmas: np.ndarray,
+    scale: float,
+    part_indices: dict[str, list[int]],
+) -> dict[str, dict[str, Any]]:
+    """Per-part OKS / score / labeled-joint count (oks=None if no labeled joints)."""
+    parts: dict[str, dict[str, Any]] = {}
+    for part, indices in part_indices.items():
+        if not indices:
+            parts[part] = {'oks': None, 'score': 0.0, 'n': 0}
+            continue
+        idx = np.asarray(indices, dtype=np.int64)
+        gt = gt_xyv[idx]
+        n = int(np.sum(gt[:, 2] > 0))
+        if n == 0:
+            parts[part] = {
+                'oks': None,
+                'score': float(joint_conf[idx].mean()),
+                'n': 0,
+            }
+            continue
+        parts[part] = {
+            'oks': compute_oks(pred_xy[idx], gt, sigmas[idx], scale),
+            'score': joint_score_for_visibility(joint_conf[idx], gt),
+            'n': n,
+        }
+    return parts
 
 
 def average_precision_at_threshold(scores: np.ndarray, oks_values: np.ndarray, threshold: float) -> float:
@@ -131,14 +225,134 @@ def _subset_metrics(scores: np.ndarray, oks_values: np.ndarray, losses: np.ndarr
     }
 
 
-def summarize_pose_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+def _visibility_class_metrics(
+    samples: list[dict[str, Any]],
+    oks_key: str,
+    score_key: str,
+    n_joints_key: str,
+) -> dict[str, float]:
+    """OKS-AP over people that have ≥1 joint in the class; score ranks by class conf."""
+    subset = [s for s in samples if s.get(oks_key) is not None]
+    if not subset:
+        empty = _subset_metrics(np.array([]), np.array([]), np.array([]))
+        return {
+            **empty,
+            'num_people_with_class': 0,
+            'num_joints': 0,
+            'mean_joints_per_person': 0.0,
+        }
+    scores = np.asarray([s[score_key] for s in subset], dtype=np.float64)
+    oks_values = np.asarray([s[oks_key] for s in subset], dtype=np.float64)
+    # Loss is person-level (not visibility-split); keep for context only.
+    losses = np.asarray([s['loss'] for s in subset], dtype=np.float64)
+    joint_counts = np.asarray([s[n_joints_key] for s in subset], dtype=np.float64)
+    metrics = _subset_metrics(scores, oks_values, losses)
+    metrics['num_people_with_class'] = int(len(subset))
+    metrics['num_joints'] = int(joint_counts.sum())
+    metrics['mean_joints_per_person'] = _safe_mean(joint_counts)
+    return metrics
+
+
+def _body_part_class_metrics(
+    samples: list[dict[str, Any]],
+    part: str,
+) -> dict[str, float]:
+    subset = [
+        s
+        for s in samples
+        if s.get('parts') and s['parts'].get(part) and s['parts'][part]['oks'] is not None
+    ]
+    if not subset:
+        empty = _subset_metrics(np.array([]), np.array([]), np.array([]))
+        return {
+            **empty,
+            'num_people_with_class': 0,
+            'num_joints': 0,
+            'mean_joints_per_person': 0.0,
+        }
+    scores = np.asarray([s['parts'][part]['score'] for s in subset], dtype=np.float64)
+    oks_values = np.asarray([s['parts'][part]['oks'] for s in subset], dtype=np.float64)
+    losses = np.asarray([s['loss'] for s in subset], dtype=np.float64)
+    joint_counts = np.asarray([s['parts'][part]['n'] for s in subset], dtype=np.float64)
+    metrics = _subset_metrics(scores, oks_values, losses)
+    metrics['num_people_with_class'] = int(len(subset))
+    metrics['num_joints'] = int(joint_counts.sum())
+    metrics['mean_joints_per_person'] = _safe_mean(joint_counts)
+    return metrics
+
+
+def summarize_body_part_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Global (not per-task) OKS-AP for head / arms / legs / feet."""
+    part_names = list(BODY_PART_JOINT_NAMES.keys())
+    if samples and samples[0].get('parts'):
+        part_names = list(samples[0]['parts'].keys())
+    return {
+        'description': (
+            'Person-level OKS-AP restricted to body-part joint subsets. '
+            'Same OKS/AP thresholds as primary; people with no labeled joints in '
+            'the part are omitted. No per-task breakdown.'
+        ),
+        'parts': {part: _body_part_class_metrics(samples, part) for part in part_names},
+    }
+
+
+def summarize_custom_metrics(
+    samples: list[dict[str, Any]],
+    ownership: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extra eval suites that do not replace primary OKS-AP.
+
+    Expects optional per-sample keys from evaluate:
+      oks_visible / score_visible / n_visible
+      oks_occluded / score_occluded / n_occluded
+      parts: {part: {oks, score, n}}
+    Optional ownership summary (swap / collapse / xy-mix) is attached as-is.
+    """
+    custom: dict[str, Any] = {
+        'visibility_split': {
+            'description': (
+                'Person-level OKS-AP restricted to GT visibility: '
+                'visible=v==2, occluded=v==1. Same OKS/AP thresholds as primary; '
+                'people with no joints in the class are omitted. Ranking score is '
+                'mean SimCC confidence over that class.'
+            ),
+            'visible': _visibility_class_metrics(
+                samples, 'oks_visible', 'score_visible', 'n_visible'
+            ),
+            'occluded': _visibility_class_metrics(
+                samples, 'oks_occluded', 'score_occluded', 'n_occluded'
+            ),
+        },
+        'body_parts': summarize_body_part_metrics(samples),
+    }
+    if ownership is not None:
+        custom['ownership'] = {
+            'description': (
+                'Partner swap / collapse / SimCC x-y mix rates (global + IoU buckets). '
+                'No per-task breakdown. overall = samples with a partner on the frame.'
+            ),
+            **ownership,
+        }
+    return custom
+
+
+def summarize_pose_metrics(
+    samples: list[dict[str, Any]],
+    ownership: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Aggregate global and per-video OKS-AP / loss metrics.
 
     Each sample dict must include: video_id, oks, loss, score.
+    Optional visibility-split / body-part keys and ownership feed metrics['custom'].
     """
     if not samples:
         empty = _subset_metrics(np.array([]), np.array([]), np.array([]))
-        return {**empty, 'std_AP_across_videos': 0.0, 'per_video': {}}
+        return {
+            **empty,
+            'std_AP_across_videos': 0.0,
+            'per_video': {},
+            'custom': summarize_custom_metrics([], ownership=ownership),
+        }
 
     scores = np.asarray([sample['score'] for sample in samples], dtype=np.float64)
     oks_values = np.asarray([sample['oks'] for sample in samples], dtype=np.float64)
@@ -164,6 +378,7 @@ def summarize_pose_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         **global_metrics,
         'std_AP_across_videos': _safe_std(np.asarray(video_aps, dtype=np.float64)),
         'per_video': per_video,
+        'custom': summarize_custom_metrics(samples, ownership=ownership),
     }
 
 
@@ -185,7 +400,55 @@ def format_metrics_summary(checkpoint_name: str, metrics: dict[str, Any]) -> str
             f'mean_loss={video_metrics["mean_loss"]:.4f}  std_loss={video_metrics["std_loss"]:.4f}  '
             f'n={video_metrics["num_samples"]}'
         )
+
+    custom = metrics.get('custom') or {}
+    vis = custom.get('visibility_split')
+    if vis:
+        lines.append('  [custom] visibility_split (OKS-AP on v==2 vs v==1 only)')
+        for label in ('visible', 'occluded'):
+            m = vis[label]
+            lines.append(
+                f'    {label:<10} AP={m["AP"]:.3f}  AP50={m["AP50"]:.3f}  AP75={m["AP75"]:.3f}  '
+                f'mean_OKS={m["mean_OKS"]:.3f}  people={m["num_people_with_class"]}  '
+                f'joints={m["num_joints"]}  mean_j/person={m["mean_joints_per_person"]:.2f}'
+            )
+
+    body = custom.get('body_parts')
+    if body and body.get('parts'):
+        lines.append('  [custom] body_parts (OKS-AP; global only)')
+        for part, m in body['parts'].items():
+            lines.append(
+                f'    {part:<10} AP={m["AP"]:.3f}  AP50={m["AP50"]:.3f}  AP75={m["AP75"]:.3f}  '
+                f'mean_OKS={m["mean_OKS"]:.3f}  people={m["num_people_with_class"]}  '
+                f'joints={m["num_joints"]}'
+            )
+
+    ownership = custom.get('ownership')
+    if ownership:
+        lines.append(
+            '  [custom] ownership '
+            f"(samples={ownership.get('num_samples', 0)} "
+            f"with_partner={ownership.get('num_with_partner', 0)})"
+        )
+        overall = ownership.get('overall')
+        if overall is not None:
+            lines.append(_format_ownership_metric_line('overall', overall))
+        for bucket_name, b in (ownership.get('buckets') or {}).items():
+            lines.append(_format_ownership_metric_line(bucket_name, b))
     return '\n'.join(lines)
+
+
+def _format_ownership_metric_line(label: str, b: dict[str, Any]) -> str:
+    n = int(b.get('n') or 0)
+    if n == 0 or b.get('swap_rate') is None:
+        return f'    {label:<10} n={n}  —'
+    return (
+        f'    {label:<10} n={n}  '
+        f'swap={b["swap_rate"]:.3f}±{b["swap_rate_se"]:.3f}  '
+        f'collapse={b["collapse_rate"]:.3f}±{b["collapse_rate_se"]:.3f}  '
+        f'xy_mix={b["xy_mix_rate"]:.3f}±{b["xy_mix_rate_se"]:.3f}  '
+        f'oks_self={b["mean_oks_self"]:.3f}  oks_partner={b["mean_oks_partner"]:.3f}'
+    )
 
 
 def write_metrics_json(metrics: dict[str, Any], output_path: Path) -> None:
@@ -246,6 +509,7 @@ def evaluate_run_folder(
             output_dir=run_dir / checkpoint_name,
             device=torch_device,
             batch_size=eval_batch_size,
+            annotation_version=config['dataset'].annotation_version,
         )
     return results
 

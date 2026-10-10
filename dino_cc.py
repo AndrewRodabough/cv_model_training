@@ -203,11 +203,15 @@ class _JointQueryDecoderLayer(nn.Module):
       queries: torch.Tensor,
       memory: torch.Tensor,
       cond: torch.Tensor | None = None,
+      self_attn_bias: torch.Tensor | None = None,
+      cross_attn_bias: torch.Tensor | None = None,
   ) -> torch.Tensor:
     q_base = self.norm_q(queries)
     q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    attn_out, _ = self.cross_attn(
+        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    )
     queries = queries + attn_out
     queries = queries + self.ffn(self.norm_ffn(queries))
     return queries
@@ -247,23 +251,74 @@ class _JointQuerySelfAttnDecoderLayer(nn.Module):
       queries: torch.Tensor,
       memory: torch.Tensor,
       cond: torch.Tensor | None = None,
+      self_attn_bias: torch.Tensor | None = None,
+      cross_attn_bias: torch.Tensor | None = None,
   ) -> torch.Tensor:
     q_content = self.norm_self(queries)
     if cond is not None:
       q_self = q_content + cond
       k_self = q_content + cond
-      self_out, _ = self.self_attn(q_self, k_self, q_content, need_weights=False)
+      self_out, _ = self.self_attn(
+          q_self, k_self, q_content, attn_mask=self_attn_bias, need_weights=False
+      )
     else:
-      self_out, _ = self.self_attn(q_content, q_content, q_content, need_weights=False)
+      self_out, _ = self.self_attn(
+          q_content,
+          q_content,
+          q_content,
+          attn_mask=self_attn_bias,
+          need_weights=False,
+      )
     queries = queries + self_out
 
     q_base = self.norm_q(queries)
     q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    cross_out, _ = self.cross_attn(
+        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    )
     queries = queries + cross_out
     queries = queries + self.ffn(self.norm_ffn(queries))
     return queries
+
+
+def build_lr_shared_pair_bias_index(
+    num_joints: int,
+    bone_pairs: list[tuple[int, int]],
+    left_right_pairs: list[tuple[int, int]],
+) -> torch.Tensor:
+  """Build [K, K] long index into shared bias params (−1 = unused).
+
+  Undirected bone edges share a type. Left and right mirror edges share one type
+  so L/R structure is tied (helps side swaps).
+  """
+  mirror = list(range(num_joints))
+  for left_i, right_i in left_right_pairs:
+    mirror[left_i] = right_i
+    mirror[right_i] = left_i
+
+  def undirected(i: int, j: int) -> tuple[int, int]:
+    return (i, j) if i <= j else (j, i)
+
+  def canonical(i: int, j: int) -> tuple[int, int]:
+    e1 = undirected(i, j)
+    e2 = undirected(mirror[i], mirror[j])
+    return e1 if e1 <= e2 else e2
+
+  type_ids: dict[tuple[int, int], int] = {}
+  for parent, child in bone_pairs:
+    if not (0 <= parent < num_joints and 0 <= child < num_joints):
+      raise ValueError(f'bone pair ({parent}, {child}) out of range for K={num_joints}')
+    key = canonical(parent, child)
+    if key not in type_ids:
+      type_ids[key] = len(type_ids)
+
+  index = torch.full((num_joints, num_joints), -1, dtype=torch.long)
+  for parent, child in bone_pairs:
+    tid = type_ids[canonical(parent, child)]
+    index[parent, child] = tid
+    index[child, parent] = tid
+  return index
 
 
 class _BaseJointQuerySimCCHead(BaseSimCCHead):
@@ -297,6 +352,14 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       per_layer_role_reinject: bool = False,
       use_spatial_prompt: bool = False,
       deep_supervision: bool = False,
+      use_joint_pos_embed: bool = False,
+      use_pair_bias: bool = False,
+      pair_bias_bones: list[tuple[int, int]] | None = None,
+      pair_bias_lr_pairs: list[tuple[int, int]] | None = None,
+      pair_bias_init: float = 2.0,
+      use_local_cross_attn: bool = False,
+      local_attn_sigma: float = 2.0,
+      local_attn_strength: float = 2.0,
       **kwargs,
   ):
     super().__init__()
@@ -306,9 +369,12 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       raise ValueError(
           f'soft_foot_anchor_init must be in (0, 1), got {soft_foot_anchor_init}'
       )
+    if use_local_cross_attn and local_attn_sigma <= 0:
+      raise ValueError(f'local_attn_sigma must be > 0, got {local_attn_sigma}')
 
     self.grid_size = grid_size
     self.neck_dim = neck_dim
+    self.num_heads = num_heads
     self.num_joints = num_joints
     self.soft_foot_anchor = soft_foot_anchor
     self.use_role = use_role
@@ -316,6 +382,13 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.per_layer_role_reinject = per_layer_role_reinject
     self.use_spatial_prompt = use_spatial_prompt
     self.deep_supervision = deep_supervision
+    self.use_joint_pos_embed = use_joint_pos_embed
+    self.use_pair_bias = use_pair_bias
+    self.use_local_cross_attn = use_local_cross_attn
+    self.local_attn_sigma = float(local_attn_sigma)
+    self.local_attn_strength = float(local_attn_strength)
+    self.split_ratio = float(split_ratio)
+    self.out_size = out_size
     self.out_bins_size = IVec2(
         int(out_size.x * split_ratio), int(out_size.y * split_ratio)
     )
@@ -346,6 +419,34 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       )
     else:
       self.spatial_mlp = None
+    if use_joint_pos_embed:
+      # Map crop-normalized (x, y) ∈ [0, 1]^2 → query residual.
+      self.joint_pos_mlp = nn.Sequential(
+          nn.Linear(2, neck_dim),
+          nn.GELU(),
+          nn.Linear(neck_dim, neck_dim),
+      )
+      nn.init.zeros_(self.joint_pos_mlp[-1].weight)
+      nn.init.zeros_(self.joint_pos_mlp[-1].bias)
+    else:
+      self.joint_pos_mlp = None
+    if use_pair_bias:
+      if not pair_bias_bones:
+        raise ValueError('use_pair_bias=True requires non-empty pair_bias_bones')
+      lr_pairs = list(pair_bias_lr_pairs or [])
+      bias_index = build_lr_shared_pair_bias_index(
+          num_joints, list(pair_bias_bones), lr_pairs
+      )
+      num_types = int(bias_index.max().item()) + 1
+      if num_types <= 0:
+        raise ValueError('use_pair_bias=True produced zero shared edge types')
+      self.register_buffer('pair_bias_index', bias_index, persistent=True)
+      self.pair_bias_values = nn.Parameter(
+          torch.full((num_types,), float(pair_bias_init), dtype=torch.float32)
+      )
+    else:
+      self.pair_bias_index = None
+      self.pair_bias_values = None
 
     if soft_foot_anchor:
       if not foot_anchor_pairs:
@@ -415,6 +516,56 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       cond = cond + self.spatial_mlp(spatial).unsqueeze(1)
     return cond
 
+  def _materialize_pair_bias(self, dtype, device) -> torch.Tensor | None:
+    if not self.use_pair_bias or self.pair_bias_values is None or self.pair_bias_index is None:
+      return None
+    # Additive attention mask: skeleton edges start positive so neighbors attend first.
+    bias = torch.zeros(
+        self.num_joints, self.num_joints, device=device, dtype=dtype
+    )
+    valid = self.pair_bias_index >= 0
+    bias[valid] = self.pair_bias_values[self.pair_bias_index[valid]].to(dtype=dtype)
+    return bias
+
+  def _soft_decode_normed(
+      self, pred_x: torch.Tensor, pred_y: torch.Tensor
+  ) -> torch.Tensor:
+    """Soft-argmax SimCC → crop-normalized [B, K, 2] in [0, 1]."""
+    px = F.softmax(pred_x.float(), dim=-1)
+    py = F.softmax(pred_y.float(), dim=-1)
+    bins_x = torch.arange(pred_x.shape[-1], device=pred_x.device, dtype=px.dtype)
+    bins_y = torch.arange(pred_y.shape[-1], device=pred_y.device, dtype=py.dtype)
+    x = (px * bins_x).sum(dim=-1) / self.split_ratio / max(self.out_size.x, 1)
+    y = (py * bins_y).sum(dim=-1) / self.split_ratio / max(self.out_size.y, 1)
+    return torch.stack((x, y), dim=-1).clamp(0.0, 1.0)
+
+  def _gaussian_cross_attn_bias(
+      self, normed_xy: torch.Tensor, batch_size: int, dtype, device
+  ) -> torch.Tensor:
+    """Additive cross-attn bias [B*heads, K, N] peaked at each joint's patch.
+
+    ``normed_xy`` is crop-normalized [B, K, 2] (x, y) in [0, 1]. Distances are
+    in patch-grid units; ``local_attn_sigma`` is the Gaussian width in patches.
+    """
+    gw = self.grid_size.x
+    gh = self.grid_size.y
+    xs = (torch.arange(gw, device=device, dtype=dtype) + 0.5) / gw
+    ys = (torch.arange(gh, device=device, dtype=dtype) + 0.5) / gh
+    # meshgrid ij → (y, x); stack as (x, y) to match soft-decode order
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    patch_xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=-1)  # [N, 2]
+    scale = torch.tensor([gw, gh], device=device, dtype=dtype)
+    diff = normed_xy.to(dtype=dtype).unsqueeze(2) - patch_xy.view(1, 1, -1, 2)
+    dist_sq = (diff * scale).pow(2).sum(dim=-1)  # [B, K, N]
+    sigma = self.local_attn_sigma
+    bias = self.local_attn_strength * torch.exp(-dist_sq / (2.0 * sigma * sigma))
+    # MHA float attn_mask expects [B * num_heads, tgt_len, src_len]
+    return (
+        bias.unsqueeze(1)
+        .expand(batch_size, self.num_heads, self.num_joints, -1)
+        .reshape(batch_size * self.num_heads, self.num_joints, -1)
+    )
+
   def forward(
       self,
       patch_tokens: torch.Tensor,
@@ -436,11 +587,41 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       if self.role_conditioner.use_film:
         memory = self.role_conditioner.film_features(memory, role)
     cond = self._build_layer_cond(B, role, spatial, memory.device, memory.dtype)
+    self_attn_bias = self._materialize_pair_bias(memory.dtype, memory.device)
     aux_preds: list[tuple[torch.Tensor, torch.Tensor]] = []
+    prev_pred_x = prev_pred_y = None
+    need_layer_preds = (
+        self.deep_supervision or self.use_joint_pos_embed or self.use_local_cross_attn
+    )
     for layer in self.layers:
-      queries = layer(queries, memory, cond)
-      if self.deep_supervision:
-        aux_preds.append((self.fc_x(queries), self.fc_y(queries)))
+      normed = None
+      if prev_pred_x is not None and prev_pred_y is not None:
+        # Detach so early layers get gradients from deep-sup, not through feedback.
+        normed = self._soft_decode_normed(prev_pred_x.detach(), prev_pred_y.detach())
+      if (
+          self.use_joint_pos_embed
+          and self.joint_pos_mlp is not None
+          and normed is not None
+      ):
+        queries = queries + self.joint_pos_mlp(normed.to(dtype=queries.dtype))
+      cross_attn_bias = None
+      if self.use_local_cross_attn and normed is not None:
+        cross_attn_bias = self._gaussian_cross_attn_bias(
+            normed, B, memory.dtype, memory.device
+        )
+      queries = layer(
+          queries,
+          memory,
+          cond,
+          self_attn_bias=self_attn_bias,
+          cross_attn_bias=cross_attn_bias,
+      )
+      if need_layer_preds:
+        pred_x_i = self.fc_x(queries)
+        pred_y_i = self.fc_y(queries)
+        prev_pred_x, prev_pred_y = pred_x_i, pred_y_i
+        if self.deep_supervision:
+          aux_preds.append((pred_x_i, pred_y_i))
 
     if self.deep_supervision:
       pred_x, pred_y = aux_preds[-1]
@@ -616,14 +797,25 @@ class DinoCC(nn.Module):
         return pred_x, pred_y
 
 
-def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0):
+def generate_simcc_labels(
+    keypoints,
+    img_size: IVec2,
+    split_ratio=2.0,
+    sigma=6.0,
+    sigma_occluded: float | None = None,
+    occluded_weight: float = 0.35,
+):
     """
     Args:
         keypoints: Array-like of shape [K, 3] with rows: [x, y, visibility]
                    Coordinates must be relative to the cropped 336x448 image.
         img_size: IVec2(x=336, y=448)
         split_ratio: Sub-pixel scaling factor (2.0 = 0.5px bins)
-        sigma: Standard deviation of the Gaussian label distribution in bin units
+        sigma: Gaussian std (bin units) for visible joints (v==2)
+        sigma_occluded: Gaussian std for occluded joints (v==1). None → same as sigma.
+            Wider values soften the target so near-misses cost less while wild
+            misses still get KL pressure via the tails.
+        occluded_weight: Loss weight for occluded joints (v==1); visible use 1.0.
     Returns:
         target_x: [K, out_bins_x]
         target_y: [K, out_bins_y]
@@ -632,6 +824,16 @@ def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0
     num_joints = len(keypoints)
     bins_x = int(img_size.x * split_ratio)
     bins_y = int(img_size.y * split_ratio)
+    sigma = float(sigma)
+    sigma_occ = float(sigma_occluded) if sigma_occluded is not None else sigma
+    occ_w = float(occluded_weight)
+    if sigma <= 0 or sigma_occ <= 0:
+        raise ValueError(
+            f'sigma and sigma_occluded must be > 0, got sigma={sigma}, '
+            f'sigma_occluded={sigma_occ}'
+        )
+    if not 0.0 < occ_w <= 1.0:
+        raise ValueError(f'occluded_weight must be in (0, 1], got {occ_w}')
 
     target_x = np.zeros((num_joints, bins_x), dtype=np.float32)
     target_y = np.zeros((num_joints, bins_y), dtype=np.float32)
@@ -648,17 +850,18 @@ def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0
         # Scale continuous pixels to sub-pixel bin centers
         mu_x = x * split_ratio
         mu_y = y * split_ratio
+        joint_sigma = sigma if v == 2 else sigma_occ
 
         # Continuous 1D Gaussian distributions
-        gx = np.exp(-((x_bins - mu_x) ** 2) / (2.0 * sigma ** 2))
-        gy = np.exp(-((y_bins - mu_y) ** 2) / (2.0 * sigma ** 2))
+        gx = np.exp(-((x_bins - mu_x) ** 2) / (2.0 * joint_sigma ** 2))
+        gy = np.exp(-((y_bins - mu_y) ** 2) / (2.0 * joint_sigma ** 2))
 
         # Normalize to valid probability density
         target_x[k] = gx / (gx.sum() + 1e-8)
         target_y[k] = gy / (gy.sum() + 1e-8)
 
-        # Visibility weighting: full weight if visible, 0.35 if occluded by partner/clothing
-        weights[k] = 1.0 if v == 2 else 0.35
+        # Visibility weighting: full weight if visible, reduced if occluded
+        weights[k] = 1.0 if v == 2 else occ_w
 
     return (
         torch.from_numpy(target_x),

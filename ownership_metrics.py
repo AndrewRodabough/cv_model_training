@@ -90,52 +90,57 @@ def joint_xy_mix_fraction(
     return mixed / counted, counted
 
 
+def _ownership_rate_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    n = len(rows)
+    if n == 0:
+        return {
+            'n': 0,
+            'swap_rate': None,
+            'swap_rate_se': None,
+            'collapse_rate': None,
+            'collapse_rate_se': None,
+            'xy_mix_rate': None,
+            'xy_mix_rate_se': None,
+            'xy_mix_samples': 0,
+            'mean_oks_self': None,
+            'mean_oks_partner': None,
+        }
+    swaps = [r['swap'] for r in rows]
+    collapses = [r['collapse'] for r in rows]
+    xy_mix = [r['xy_mix_rate'] for r in rows if r['xy_mix_joints'] > 0]
+    swap_rate = float(np.mean(swaps))
+    collapse_rate = float(np.mean(collapses))
+    xy_mix_rate = float(np.mean(xy_mix)) if xy_mix else 0.0
+    xy_n = len(xy_mix)
+    return {
+        'n': n,
+        'swap_rate': swap_rate,
+        'swap_rate_se': binomial_se(swap_rate, n),
+        'collapse_rate': collapse_rate,
+        'collapse_rate_se': binomial_se(collapse_rate, n),
+        'xy_mix_rate': xy_mix_rate,
+        'xy_mix_rate_se': binomial_se(xy_mix_rate, xy_n) if xy_n else 0.0,
+        'xy_mix_samples': xy_n,
+        'mean_oks_self': float(np.mean([r['oks_self'] for r in rows])),
+        'mean_oks_partner': float(np.mean([r['oks_partner'] for r in rows])),
+    }
+
+
 def summarize_ownership_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate per-sample records into bucketed rates with counts and SE."""
+    """Aggregate per-sample records into overall + IoU-bucketed rates (no per-task)."""
     by_bucket: dict[str, list[dict]] = defaultdict(list)
     for rec in records:
         by_bucket[rec['iou_bucket']].append(rec)
 
+    partner_rows = [r for r in records if r['has_partner']]
     out: dict[str, Any] = {
         'num_samples': len(records),
-        'num_with_partner': sum(1 for r in records if r['has_partner']),
+        'num_with_partner': len(partner_rows),
+        'overall': _ownership_rate_block(partner_rows),
         'buckets': {},
     }
     for bucket_name, _, _ in IOU_BUCKETS:
-        rows = by_bucket.get(bucket_name, [])
-        n = len(rows)
-        if n == 0:
-            out['buckets'][bucket_name] = {
-                'n': 0,
-                'swap_rate': None,
-                'swap_rate_se': None,
-                'collapse_rate': None,
-                'collapse_rate_se': None,
-                'xy_mix_rate': None,
-                'xy_mix_rate_se': None,
-                'mean_oks_self': None,
-                'mean_oks_partner': None,
-            }
-            continue
-        swaps = [r['swap'] for r in rows]
-        collapses = [r['collapse'] for r in rows]
-        xy_mix = [r['xy_mix_rate'] for r in rows if r['xy_mix_joints'] > 0]
-        swap_rate = float(np.mean(swaps))
-        collapse_rate = float(np.mean(collapses))
-        xy_mix_rate = float(np.mean(xy_mix)) if xy_mix else 0.0
-        xy_n = len(xy_mix)
-        out['buckets'][bucket_name] = {
-            'n': n,
-            'swap_rate': swap_rate,
-            'swap_rate_se': binomial_se(swap_rate, n),
-            'collapse_rate': collapse_rate,
-            'collapse_rate_se': binomial_se(collapse_rate, n),
-            'xy_mix_rate': xy_mix_rate,
-            'xy_mix_rate_se': binomial_se(xy_mix_rate, xy_n) if xy_n else 0.0,
-            'xy_mix_samples': xy_n,
-            'mean_oks_self': float(np.mean([r['oks_self'] for r in rows])),
-            'mean_oks_partner': float(np.mean([r['oks_partner'] for r in rows])),
-        }
+        out['buckets'][bucket_name] = _ownership_rate_block(by_bucket.get(bucket_name, []))
     return out
 
 
@@ -145,25 +150,26 @@ def write_ownership_json(metrics: dict[str, Any], path: Path) -> None:
         json.dump(metrics, f, indent=2)
 
 
+def _format_ownership_row(label: str, b: dict[str, Any]) -> str:
+    n = b['n']
+    if n == 0 or b['swap_rate'] is None:
+        return f'{label:<10} {n:5d}     —        —        —       —       —'
+    return (
+        f"{label:<10} {n:5d} {b['swap_rate']:7.3f}±{b['swap_rate_se']:.3f} "
+        f"{b['collapse_rate']:7.3f}±{b['collapse_rate_se']:.3f} "
+        f"{b['xy_mix_rate']:7.3f}±{b['xy_mix_rate_se']:.3f} "
+        f"{b['mean_oks_self']:8.3f} {b['mean_oks_partner']:8.3f}"
+    )
+
+
 def format_ownership_summary(metrics: dict[str, Any]) -> str:
     lines = [
         f"samples={metrics['num_samples']} with_partner={metrics['num_with_partner']}",
         '',
         f"{'bucket':<10} {'n':>5} {'swap':>8} {'collapse':>10} {'xy_mix':>8} {'oks_self':>9} {'oks_part':>9}",
     ]
+    if 'overall' in metrics:
+        lines.append(_format_ownership_row('overall', metrics['overall']))
     for bucket_name, _, _ in IOU_BUCKETS:
-        b = metrics['buckets'][bucket_name]
-        n = b['n']
-        if n == 0:
-            lines.append(f'{bucket_name:<10} {n:5d}     —        —        —       —       —')
-            continue
-        swap = b['swap_rate']
-        col = b['collapse_rate']
-        xy = b['xy_mix_rate']
-        lines.append(
-            f"{bucket_name:<10} {n:5d} {swap:7.3f}±{b['swap_rate_se']:.3f} "
-            f"{col:7.3f}±{b['collapse_rate_se']:.3f} "
-            f"{xy:7.3f}±{b['xy_mix_rate_se']:.3f} "
-            f"{b['mean_oks_self']:8.3f} {b['mean_oks_partner']:8.3f}"
-        )
+        lines.append(_format_ownership_row(bucket_name, metrics['buckets'][bucket_name]))
     return '\n'.join(lines)
