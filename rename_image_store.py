@@ -19,16 +19,9 @@ def parse_image_name(path):
     return int(match.group("frame")), int(match.group("suffix") or 0)
 
 
-def load_tasks(annotation_path):
-    root = ET.parse(annotation_path).getroot()
-    tasks = root.findall("./meta/project/tasks/task")
-    if not tasks:
-        tasks = root.findall(".//task")
-    if not tasks:
-        raise ValueError(f"No CVAT tasks found in {annotation_path}")
-
+def _parse_task_elements(task_elements):
     task_data = []
-    for task in tasks:
+    for task in task_elements:
         task_id = task.findtext("id")
         size = task.findtext("size")
         if task_id is None or not task_id.strip() or size is None:
@@ -37,6 +30,56 @@ def load_tasks(annotation_path):
             raise ValueError(f"Invalid CVAT task ID: {task_id!r}")
         task_data.append((task_id, int(size)))
     return task_data
+
+
+def _load_project_task_list(project_annotations):
+    root = ET.parse(project_annotations).getroot()
+    tasks = root.findall("./meta/project/tasks/task")
+    if not tasks:
+        raise ValueError(
+            f"No project tasks found in {project_annotations}. "
+            "Expected meta/project/tasks/task entries."
+        )
+    return _parse_task_elements(tasks)
+
+
+def _resolve_job_task(job_element, project_annotations):
+    size_text = job_element.findtext("size")
+    if size_text is None:
+        raise ValueError("CVAT job export is missing size metadata.")
+    size = int(size_text)
+    project_tasks = _load_project_task_list(project_annotations)
+    matches = [(task_id, task_size) for task_id, task_size in project_tasks if task_size == size]
+    if len(matches) != 1:
+        raise ValueError(
+            f"CVAT job export (size={size}) matched {len(matches)} project tasks in "
+            f"{project_annotations}; need exactly one match to choose task_id."
+        )
+    return matches
+
+
+def load_tasks(annotation_path, project_annotations=None):
+    annotation_path = Path(annotation_path)
+    root = ET.parse(annotation_path).getroot()
+
+    project_tasks = root.findall("./meta/project/tasks/task")
+    if project_tasks:
+        return _parse_task_elements(project_tasks)
+
+    task = root.find("./meta/task")
+    if task is not None:
+        return _parse_task_elements([task])
+
+    job = root.find("./meta/job")
+    if job is not None:
+        if project_annotations is None:
+            raise ValueError(
+                f"CVAT job export in {annotation_path} does not include task id "
+                "(only job/segment id). Pass project annotations to resolve task_id."
+            )
+        return _resolve_job_task(job, project_annotations)
+
+    raise ValueError(f"No CVAT tasks found in {annotation_path}")
 
 
 def build_mapping(images_dir, tasks):
@@ -70,7 +113,9 @@ def build_mapping(images_dir, tasks):
     return mapping
 
 
-def rename_image_store(images, annotations, output=None, apply=False):
+def rename_image_store(
+    images, annotations, output=None, apply=False, project_annotations=None
+):
     """Map CVAT collision-suffixed frames to task/frame names.
 
     Returns the (source_path, output_name) mapping. When apply is True, also
@@ -84,7 +129,7 @@ def rename_image_store(images, annotations, output=None, apply=False):
         raise FileNotFoundError(annotations)
 
     output_dir = Path(output) if output is not None else images / "named"
-    tasks = load_tasks(annotations)
+    tasks = load_tasks(annotations, project_annotations=project_annotations)
     mapping = build_mapping(images, tasks)
 
     print(f"Tasks: {len(tasks)}")
@@ -149,12 +194,18 @@ def main():
         action="store_true",
         help="Write files. Without this flag, only print the planned mapping.",
     )
+    parser.add_argument(
+        "--project-annotations",
+        type=Path,
+        help="Project annotations.xml (required for CVAT job exports).",
+    )
     args = parser.parse_args()
     rename_image_store(
         images=args.images,
         annotations=args.annotations,
         output=args.output,
         apply=args.apply,
+        project_annotations=args.project_annotations,
     )
 
 

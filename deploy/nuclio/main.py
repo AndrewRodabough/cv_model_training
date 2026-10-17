@@ -1,4 +1,4 @@
-"""CVAT Nuclio handler for DinoCC dance_20 pose estimation."""
+"""CVAT Nuclio handler for DinoCC dance_23 pose estimation."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from vec import IVec2
 FUNCTION_DIR = Path(__file__).resolve().parent
 WEIGHTS_PATH = Path(os.environ.get('DINOCC_WEIGHTS', str(FUNCTION_DIR / 'weights' / 'best.pt')))
 BACKBONE_DIR = Path(os.environ.get('DINOCC_BACKBONE', str(FUNCTION_DIR / 'backbone')))
-MAPPING_PATH = FUNCTION_DIR / 'mapping' / 'dance_20.yaml'
+MAPPING_PATH = FUNCTION_DIR / 'mapping' / 'dance_23.yaml'
 
 IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -159,7 +159,7 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device):
 
 
 def init_context(context):
-    context.logger.info('Initializing DinoCC dance_20...')
+    context.logger.info('Initializing DinoCC dance_23...')
     if not WEIGHTS_PATH.is_file():
         raise FileNotFoundError(
             f'Missing checkpoint at {WEIGHTS_PATH}. '

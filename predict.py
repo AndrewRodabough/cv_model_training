@@ -80,7 +80,7 @@ def prepare_image(image, crop_info):
     return pixels.unsqueeze(0), crop_info
 
 
-def draw_prediction(image, coordinates, crop_info, output_path):
+def draw_prediction(image, coordinates, crop_info, output_path, person_joints=None):
     crop_x1, crop_y1, crop_width, crop_height = crop_info
     draw = ImageDraw.Draw(image)
     if crop_width != image.width or crop_height != image.height:
@@ -90,23 +90,43 @@ def draw_prediction(image, coordinates, crop_info, output_path):
             width=1,
         )
 
-    points = []
-    for x, y in coordinates:
-        original_x = crop_x1 + x * crop_width / IMAGE_SIZE.x
-        original_y = crop_y1 + y * crop_height / IMAGE_SIZE.y
-        points.append((original_x, original_y))
+    if person_joints is None:
+        person_joints = len(KEYPOINT_IDS)
+    banks = (
+        [(0, person_joints, 'lime', 'red'), (person_joints, 2 * person_joints, 'cyan', 'magenta')]
+        if len(coordinates) == 2 * person_joints
+        else [(0, len(coordinates), 'lime', 'red')]
+    )
 
-    point_by_id = dict(zip(KEYPOINT_IDS, points))
-    for first_id, second_id in SKELETON_CONNECTIONS:
-        first = point_by_id.get(first_id)
-        second = point_by_id.get(second_id)
-        if first is not None and second is not None:
-            draw.line((first, second), fill='lime', width=1)
+    for start, end, line_color, point_color in banks:
+        bank_coords = coordinates[start:end]
+        points = []
+        for x, y in bank_coords:
+            original_x = crop_x1 + x * crop_width / IMAGE_SIZE.x
+            original_y = crop_y1 + y * crop_height / IMAGE_SIZE.y
+            points.append((original_x, original_y))
 
-    for index, (x, y) in enumerate(points):
-        radius = 2
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill='red', outline='white')
-        draw.text((x + 4, y - 4), str(KEYPOINT_IDS[index]), fill='white', stroke_width=1, stroke_fill='black')
+        point_by_id = dict(zip(KEYPOINT_IDS, points))
+        for first_id, second_id in SKELETON_CONNECTIONS:
+            first = point_by_id.get(first_id)
+            second = point_by_id.get(second_id)
+            if first is not None and second is not None:
+                draw.line((first, second), fill=line_color, width=1)
+
+        for index, (x, y) in enumerate(points):
+            radius = 2
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=point_color,
+                outline='white',
+            )
+            draw.text(
+                (x + 4, y - 4),
+                str(KEYPOINT_IDS[index]),
+                fill='white',
+                stroke_width=1,
+                stroke_fill='black',
+            )
 
     image.save(output_path)
 
@@ -115,7 +135,7 @@ def main():
     parser = argparse.ArgumentParser(description='Overlay DinoCC keypoint predictions on an image.')
     parser.add_argument('weights', type=Path, help='Path to a DinoCC checkpoint.')
     parser.add_argument('image', type=Path, help='Path to the image to process.')
-    parser.add_argument('--bbox', nargs=4, type=float, metavar=('X1', 'Y1', 'X2', 'Y2'), help='Optional person bbox in source-image pixels.')
+    parser.add_argument('--bbox', nargs=4, type=float, metavar=('X1', 'Y1', 'X2', 'Y2'), help='Optional person (or union) bbox in source-image pixels.')
     parser.add_argument(
         '--role',
         choices=('lead', 'follow'),
@@ -140,8 +160,14 @@ def main():
             f'Checkpoint keypoints {checkpoint_keypoint_ids} do not match this inference script {KEYPOINT_IDS}.'
         )
 
+    couple_mode = bool(checkpoint.get('couple_mode', False)) or (
+        checkpoint.get('head_name') == 'couple_joint_query_self_attn_simcc'
+    )
+    person_joints = int(checkpoint.get('person_joints', len(KEYPOINT_IDS)))
+    num_joints = int(checkpoint.get('num_joints', 2 * person_joints if couple_mode else person_joints))
+
     model = DinoCC(
-        num_joints=len(KEYPOINT_IDS),
+        num_joints=num_joints,
         img_size=IVec2(IMAGE_SIZE.x, IMAGE_SIZE.y),
         backbone_name=checkpoint.get('backbone_name', 'facebook/dinov2-base'),
         head_name=checkpoint.get('head_name', 'depthwise_simcc'),
@@ -160,12 +186,31 @@ def main():
     use_role = bool(checkpoint.get('use_role', False)) or bool(
         (checkpoint.get('head_kwargs') or {}).get('use_role', False)
     )
+    if couple_mode:
+        use_role = False
+        if args.bbox is None:
+            print(
+                'Warning: couple-head checkpoints expect a union lead+follow bbox; '
+                'full-frame input may be unreliable.'
+            )
     role = encode_role(args.role).unsqueeze(0).to(device) if use_role else None
     if use_role and args.role is None:
         print('Warning: role-conditioned checkpoint but --role not set; using [0, 0].')
 
+    head_kwargs = checkpoint.get('head_kwargs') or {}
+    use_spatial = bool(head_kwargs.get('use_spatial_prompt', False))
+    spatial = None
+    if use_spatial:
+        from train import crop_normalized_bbox_center
+
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        x1, y1, w, h = crop_info
+        spatial = crop_normalized_bbox_center(cx, cy, x1, y1, w, h).unsqueeze(0).to(device)
+
     with torch.inference_mode():
-        pred_x, pred_y = model(pixels, role=role)
+        out = model(pixels, role=role, spatial=spatial)
+        pred_x, pred_y = out[0], out[1]
         coordinates = torch.stack(
             (
                 pred_x[0].argmax(dim=-1).float() / 2.0,
@@ -174,7 +219,13 @@ def main():
             dim=1,
         ).cpu().numpy()
 
-    draw_prediction(image, coordinates, crop_info, args.output)
+    draw_prediction(
+        image,
+        coordinates,
+        crop_info,
+        args.output,
+        person_joints=person_joints if couple_mode else None,
+    )
     print(f'Saved overlay to {args.output}')
 
 

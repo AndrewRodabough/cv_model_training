@@ -19,7 +19,14 @@ def load_backbone(backbone_name: str):
   A local directory with only ``config.json`` (no weight files) uses
   ``from_config`` so deploy packages can ship architecture metadata and load
   weights exclusively from a training checkpoint.
+
+  VitPose / VitPose++ Hub ids (``*vitpose*``) return a
+  :class:`VitPoseBackboneAdapter` that exposes DINO-like
+  ``last_hidden_state`` patch tokens for the SimCC head.
   """
+  if 'vitpose' in Path(backbone_name).name.lower() or 'vitpose' in backbone_name.lower():
+    return VitPoseBackboneAdapter.from_pretrained(backbone_name)
+
   backbone_path = Path(backbone_name)
   if backbone_path.is_dir():
     config = AutoConfig.from_pretrained(backbone_path)
@@ -28,6 +35,121 @@ def load_backbone(backbone_name: str):
       return AutoModel.from_pretrained(backbone_path)
     return AutoModel.from_config(config)
   return AutoModel.from_pretrained(backbone_name)
+
+
+class _VitPoseTokenOutput(NamedTuple):
+  last_hidden_state: torch.Tensor
+
+
+class VitPoseBackboneAdapter(nn.Module):
+  """Wrap HF VitPose(+)/++ backbone as DINO-style patch tokens.
+
+  Training crops are ``[0, 1]`` float CHW (same as the DINO path). This adapter
+  applies ImageNet mean/std, runs the VitPose backbone (MoE expert 0 for ++),
+  and bicubic-interpolates absolute pos embeds when crop size ≠ native 256×192.
+  """
+
+  IMAGENET_MEAN = (0.485, 0.456, 0.406)
+  IMAGENET_STD = (0.229, 0.224, 0.225)
+
+  def __init__(self, backbone: nn.Module, dataset_index: int = 0):
+    super().__init__()
+    self.backbone = backbone
+    self.dataset_index = int(dataset_index)
+    # Patch tokens only (no CLS/register prefix) — DinoCC uses patch_token_start.
+    self.patch_token_start = 0
+
+    bb_cfg = backbone.config
+    patch = bb_cfg.patch_size
+    if isinstance(patch, (list, tuple)):
+      if patch[0] != patch[1]:
+        raise ValueError(f'VitPose non-square patch_size unsupported: {patch}')
+      patch_size = int(patch[0])
+    else:
+      patch_size = int(patch)
+
+    # Minimal config surface expected by DinoCC / train.py checks.
+    self.config = type('VitPoseAdapterConfig', (), {})()
+    self.config.model_type = 'vitpose_backbone'
+    self.config.hidden_size = int(bb_cfg.hidden_size)
+    self.config.patch_size = patch_size
+    self.config.num_register_tokens = 0
+    self.config.num_experts = int(getattr(bb_cfg, 'num_experts', 1) or 1)
+    image_size = bb_cfg.image_size
+    if isinstance(image_size, (list, tuple)):
+      self.config.native_image_size = (int(image_size[0]), int(image_size[1]))
+    else:
+      self.config.native_image_size = (int(image_size), int(image_size))
+
+    mean = torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1)
+    self.register_buffer('_mean', mean, persistent=False)
+    self.register_buffer('_std', std, persistent=False)
+
+  @classmethod
+  def from_pretrained(cls, model_id: str, dataset_index: int = 0):
+    from transformers import VitPoseForPoseEstimation
+
+    full = VitPoseForPoseEstimation.from_pretrained(model_id)
+    return cls(full.backbone, dataset_index=dataset_index)
+
+  def _interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Bicubic-resize absolute pos embeds to the current patch grid."""
+    patch_size = self.config.patch_size
+    # Conv padding=2 → same closed-form grid as VitPosePatchEmbeddings at native size.
+    grid_h = (height + 4 - patch_size) // patch_size + 1
+    grid_w = (width + 4 - patch_size) // patch_size + 1
+    pos = self.backbone.embeddings.position_embeddings  # [1, N+1, C]
+    cls_pos = pos[:, :1]
+    patch_pos = pos[:, 1:]
+    native_h, native_w = self.config.native_image_size
+    native_gh = (native_h + 4 - patch_size) // patch_size + 1
+    native_gw = (native_w + 4 - patch_size) // patch_size + 1
+    if grid_h == native_gh and grid_w == native_gw:
+      return embeddings + patch_pos + cls_pos
+
+    dim = patch_pos.shape[-1]
+    patch_pos = patch_pos.reshape(1, native_gh, native_gw, dim).permute(0, 3, 1, 2)
+    patch_pos = F.interpolate(patch_pos, size=(grid_h, grid_w), mode='bicubic', align_corners=False)
+    patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, dim)
+    return embeddings + patch_pos + cls_pos
+
+  def forward(self, pixel_values: torch.Tensor, **kwargs):
+    # Pipeline feeds [0, 1]; VitPose was trained with ImageNet normalization.
+    pixel_values = (pixel_values - self._mean) / self._std
+    height, width = pixel_values.shape[-2:]
+
+    # Bypass hard size check + inject interpolated pos embeds.
+    patch_embeds = self.backbone.embeddings.patch_embeddings.projection(pixel_values)
+    patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+    embedding_output = self.backbone.embeddings.dropout(
+        self._interpolate_pos_encoding(patch_embeds, height, width)
+    )
+
+    dataset_index = None
+    if self.config.num_experts > 1:
+      dataset_index = torch.full(
+          (pixel_values.shape[0],),
+          self.dataset_index,
+          device=pixel_values.device,
+          dtype=torch.long,
+      )
+
+    outputs = self.backbone.encoder(
+        embedding_output,
+        dataset_index=dataset_index,
+        output_hidden_states=True,
+    )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+      raise RuntimeError('VitPose encoder returned no hidden_states')
+    feature_maps = []
+    for stage, hidden_state in zip(self.backbone.stage_names, hidden_states):
+      if stage in self.backbone.out_features:
+        feature_maps.append(self.backbone.layernorm(hidden_state))
+    if not feature_maps:
+      raise RuntimeError('VitPose backbone produced no feature maps')
+    return _VitPoseTokenOutput(last_hidden_state=feature_maps[-1])
 
 class BaseSimCCHead(nn.Module, ABC):
   """Formal interface for any SimCC head variant."""
@@ -156,7 +278,7 @@ class DepthwiseSimCCHead(BaseSimCCHead):
         RoleConditioner(neck_dim, use_film=True) if use_role and role_film else None
     )
 
-  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
+  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None, **kwargs):
     B, _, C = patch_tokens.shape
     x_2d = patch_tokens.permute(0, 2, 1).reshape(
         B, C, self.grid_size.y, self.grid_size.x
@@ -198,10 +320,20 @@ class _JointQueryDecoderLayer(nn.Module):
         nn.Dropout(dropout),
     )
 
-  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-    q = self.norm_q(queries)
+  def forward(
+      self,
+      queries: torch.Tensor,
+      memory: torch.Tensor,
+      cond: torch.Tensor | None = None,
+      self_attn_bias: torch.Tensor | None = None,
+      cross_attn_bias: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    q_base = self.norm_q(queries)
+    q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    attn_out, _ = self.cross_attn(
+        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    )
     queries = queries + attn_out
     queries = queries + self.ffn(self.norm_ffn(queries))
     return queries
@@ -236,17 +368,79 @@ class _JointQuerySelfAttnDecoderLayer(nn.Module):
         nn.Dropout(dropout),
     )
 
-  def forward(self, queries: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-    q_self = self.norm_self(queries)
-    self_out, _ = self.self_attn(q_self, q_self, q_self, need_weights=False)
+  def forward(
+      self,
+      queries: torch.Tensor,
+      memory: torch.Tensor,
+      cond: torch.Tensor | None = None,
+      self_attn_bias: torch.Tensor | None = None,
+      cross_attn_bias: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    q_content = self.norm_self(queries)
+    if cond is not None:
+      q_self = q_content + cond
+      k_self = q_content + cond
+      self_out, _ = self.self_attn(
+          q_self, k_self, q_content, attn_mask=self_attn_bias, need_weights=False
+      )
+    else:
+      self_out, _ = self.self_attn(
+          q_content,
+          q_content,
+          q_content,
+          attn_mask=self_attn_bias,
+          need_weights=False,
+      )
     queries = queries + self_out
 
-    q = self.norm_q(queries)
+    q_base = self.norm_q(queries)
+    q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    cross_out, _ = self.cross_attn(
+        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    )
     queries = queries + cross_out
     queries = queries + self.ffn(self.norm_ffn(queries))
     return queries
+
+
+def build_lr_shared_pair_bias_index(
+    num_joints: int,
+    bone_pairs: list[tuple[int, int]],
+    left_right_pairs: list[tuple[int, int]],
+) -> torch.Tensor:
+  """Build [K, K] long index into shared bias params (−1 = unused).
+
+  Undirected bone edges share a type. Left and right mirror edges share one type
+  so L/R structure is tied (helps side swaps).
+  """
+  mirror = list(range(num_joints))
+  for left_i, right_i in left_right_pairs:
+    mirror[left_i] = right_i
+    mirror[right_i] = left_i
+
+  def undirected(i: int, j: int) -> tuple[int, int]:
+    return (i, j) if i <= j else (j, i)
+
+  def canonical(i: int, j: int) -> tuple[int, int]:
+    e1 = undirected(i, j)
+    e2 = undirected(mirror[i], mirror[j])
+    return e1 if e1 <= e2 else e2
+
+  type_ids: dict[tuple[int, int], int] = {}
+  for parent, child in bone_pairs:
+    if not (0 <= parent < num_joints and 0 <= child < num_joints):
+      raise ValueError(f'bone pair ({parent}, {child}) out of range for K={num_joints}')
+    key = canonical(parent, child)
+    if key not in type_ids:
+      type_ids[key] = len(type_ids)
+
+  index = torch.full((num_joints, num_joints), -1, dtype=torch.long)
+  for parent, child in bone_pairs:
+    tid = type_ids[canonical(parent, child)]
+    index[parent, child] = tid
+    index[child, parent] = tid
+  return index
 
 
 class _BaseJointQuerySimCCHead(BaseSimCCHead):
@@ -277,6 +471,17 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       foot_anchor_pairs: list[tuple[int, int]] | None = None,
       use_role: bool = False,
       role_film: bool = True,
+      per_layer_role_reinject: bool = False,
+      use_spatial_prompt: bool = False,
+      deep_supervision: bool = False,
+      use_joint_pos_embed: bool = False,
+      use_pair_bias: bool = False,
+      pair_bias_bones: list[tuple[int, int]] | None = None,
+      pair_bias_lr_pairs: list[tuple[int, int]] | None = None,
+      pair_bias_init: float = 2.0,
+      use_local_cross_attn: bool = False,
+      local_attn_sigma: float = 2.0,
+      local_attn_strength: float = 2.0,
       **kwargs,
   ):
     super().__init__()
@@ -286,13 +491,26 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       raise ValueError(
           f'soft_foot_anchor_init must be in (0, 1), got {soft_foot_anchor_init}'
       )
+    if use_local_cross_attn and local_attn_sigma <= 0:
+      raise ValueError(f'local_attn_sigma must be > 0, got {local_attn_sigma}')
 
     self.grid_size = grid_size
     self.neck_dim = neck_dim
+    self.num_heads = num_heads
     self.num_joints = num_joints
     self.soft_foot_anchor = soft_foot_anchor
     self.use_role = use_role
     self.role_film = role_film
+    self.per_layer_role_reinject = per_layer_role_reinject
+    self.use_spatial_prompt = use_spatial_prompt
+    self.deep_supervision = deep_supervision
+    self.use_joint_pos_embed = use_joint_pos_embed
+    self.use_pair_bias = use_pair_bias
+    self.use_local_cross_attn = use_local_cross_attn
+    self.local_attn_sigma = float(local_attn_sigma)
+    self.local_attn_strength = float(local_attn_strength)
+    self.split_ratio = float(split_ratio)
+    self.out_size = out_size
     self.out_bins_size = IVec2(
         int(out_size.x * split_ratio), int(out_size.y * split_ratio)
     )
@@ -310,6 +528,47 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.role_conditioner = (
         RoleConditioner(neck_dim, use_film=role_film) if use_role else None
     )
+    if per_layer_role_reinject:
+      self.joint_id_embed = nn.Embedding(num_joints, neck_dim)
+      nn.init.normal_(self.joint_id_embed.weight, std=0.02)
+    else:
+      self.joint_id_embed = None
+    if use_spatial_prompt:
+      self.spatial_mlp = nn.Sequential(
+          nn.Linear(2, neck_dim),
+          nn.GELU(),
+          nn.Linear(neck_dim, neck_dim),
+      )
+    else:
+      self.spatial_mlp = None
+    if use_joint_pos_embed:
+      # Map crop-normalized (x, y) ∈ [0, 1]^2 → query residual.
+      self.joint_pos_mlp = nn.Sequential(
+          nn.Linear(2, neck_dim),
+          nn.GELU(),
+          nn.Linear(neck_dim, neck_dim),
+      )
+      nn.init.zeros_(self.joint_pos_mlp[-1].weight)
+      nn.init.zeros_(self.joint_pos_mlp[-1].bias)
+    else:
+      self.joint_pos_mlp = None
+    if use_pair_bias:
+      if not pair_bias_bones:
+        raise ValueError('use_pair_bias=True requires non-empty pair_bias_bones')
+      lr_pairs = list(pair_bias_lr_pairs or [])
+      bias_index = build_lr_shared_pair_bias_index(
+          num_joints, list(pair_bias_bones), lr_pairs
+      )
+      num_types = int(bias_index.max().item()) + 1
+      if num_types <= 0:
+        raise ValueError('use_pair_bias=True produced zero shared edge types')
+      self.register_buffer('pair_bias_index', bias_index, persistent=True)
+      self.pair_bias_values = nn.Parameter(
+          torch.full((num_types,), float(pair_bias_init), dtype=torch.float32)
+      )
+    else:
+      self.pair_bias_index = None
+      self.pair_bias_values = None
 
     if soft_foot_anchor:
       if not foot_anchor_pairs:
@@ -352,7 +611,89 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     queries[:, self.foot_anchor_foot_ids] = foot + gate * self.ankle_to_foot(ankle)
     return queries
 
-  def forward(self, patch_tokens: torch.Tensor, role: torch.Tensor | None = None):
+  def _build_layer_cond(
+      self,
+      batch_size: int,
+      role: torch.Tensor | None,
+      spatial: torch.Tensor | None,
+      device,
+      dtype,
+  ) -> torch.Tensor | None:
+    if not self.per_layer_role_reinject and not self.use_spatial_prompt:
+      return None
+    cond = torch.zeros(
+        batch_size, self.num_joints, self.neck_dim, device=device, dtype=dtype
+    )
+    if self.per_layer_role_reinject and self.joint_id_embed is not None:
+      joint_ids = torch.arange(self.num_joints, device=device, dtype=torch.long)
+      cond = cond + self.joint_id_embed(joint_ids).unsqueeze(0)
+      if self.use_role and self.role_conditioner is not None:
+        role = self.role_conditioner.resolve_role(role, batch_size, device, dtype)
+        cond = cond + self.role_conditioner.query_embed(role).unsqueeze(1)
+    if self.use_spatial_prompt and self.spatial_mlp is not None:
+      if spatial is None:
+        spatial = torch.zeros(batch_size, 2, device=device, dtype=dtype)
+      else:
+        spatial = spatial.to(device=device, dtype=dtype)
+      cond = cond + self.spatial_mlp(spatial).unsqueeze(1)
+    return cond
+
+  def _materialize_pair_bias(self, dtype, device) -> torch.Tensor | None:
+    if not self.use_pair_bias or self.pair_bias_values is None or self.pair_bias_index is None:
+      return None
+    # Additive attention mask: skeleton edges start positive so neighbors attend first.
+    bias = torch.zeros(
+        self.num_joints, self.num_joints, device=device, dtype=dtype
+    )
+    valid = self.pair_bias_index >= 0
+    bias[valid] = self.pair_bias_values[self.pair_bias_index[valid]].to(dtype=dtype)
+    return bias
+
+  def _soft_decode_normed(
+      self, pred_x: torch.Tensor, pred_y: torch.Tensor
+  ) -> torch.Tensor:
+    """Soft-argmax SimCC → crop-normalized [B, K, 2] in [0, 1]."""
+    px = F.softmax(pred_x.float(), dim=-1)
+    py = F.softmax(pred_y.float(), dim=-1)
+    bins_x = torch.arange(pred_x.shape[-1], device=pred_x.device, dtype=px.dtype)
+    bins_y = torch.arange(pred_y.shape[-1], device=pred_y.device, dtype=py.dtype)
+    x = (px * bins_x).sum(dim=-1) / self.split_ratio / max(self.out_size.x, 1)
+    y = (py * bins_y).sum(dim=-1) / self.split_ratio / max(self.out_size.y, 1)
+    return torch.stack((x, y), dim=-1).clamp(0.0, 1.0)
+
+  def _gaussian_cross_attn_bias(
+      self, normed_xy: torch.Tensor, batch_size: int, dtype, device
+  ) -> torch.Tensor:
+    """Additive cross-attn bias [B*heads, K, N] peaked at each joint's patch.
+
+    ``normed_xy`` is crop-normalized [B, K, 2] (x, y) in [0, 1]. Distances are
+    in patch-grid units; ``local_attn_sigma`` is the Gaussian width in patches.
+    """
+    gw = self.grid_size.x
+    gh = self.grid_size.y
+    xs = (torch.arange(gw, device=device, dtype=dtype) + 0.5) / gw
+    ys = (torch.arange(gh, device=device, dtype=dtype) + 0.5) / gh
+    # meshgrid ij → (y, x); stack as (x, y) to match soft-decode order
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    patch_xy = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=-1)  # [N, 2]
+    scale = torch.tensor([gw, gh], device=device, dtype=dtype)
+    diff = normed_xy.to(dtype=dtype).unsqueeze(2) - patch_xy.view(1, 1, -1, 2)
+    dist_sq = (diff * scale).pow(2).sum(dim=-1)  # [B, K, N]
+    sigma = self.local_attn_sigma
+    bias = self.local_attn_strength * torch.exp(-dist_sq / (2.0 * sigma * sigma))
+    # MHA float attn_mask expects [B * num_heads, tgt_len, src_len]
+    return (
+        bias.unsqueeze(1)
+        .expand(batch_size, self.num_heads, self.num_joints, -1)
+        .reshape(batch_size * self.num_heads, self.num_joints, -1)
+    )
+
+  def forward(
+      self,
+      patch_tokens: torch.Tensor,
+      role: torch.Tensor | None = None,
+      spatial: torch.Tensor | None = None,
+  ):
     B, N, _ = patch_tokens.shape
     expected_n = self.grid_size.x * self.grid_size.y
     if N != expected_n:
@@ -367,8 +708,47 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       queries = self.role_conditioner.bias_queries(queries, role)
       if self.role_conditioner.use_film:
         memory = self.role_conditioner.film_features(memory, role)
+    cond = self._build_layer_cond(B, role, spatial, memory.device, memory.dtype)
+    self_attn_bias = self._materialize_pair_bias(memory.dtype, memory.device)
+    aux_preds: list[tuple[torch.Tensor, torch.Tensor]] = []
+    prev_pred_x = prev_pred_y = None
+    need_layer_preds = (
+        self.deep_supervision or self.use_joint_pos_embed or self.use_local_cross_attn
+    )
     for layer in self.layers:
-      queries = layer(queries, memory)
+      normed = None
+      if prev_pred_x is not None and prev_pred_y is not None:
+        # Detach so early layers get gradients from deep-sup, not through feedback.
+        normed = self._soft_decode_normed(prev_pred_x.detach(), prev_pred_y.detach())
+      if (
+          self.use_joint_pos_embed
+          and self.joint_pos_mlp is not None
+          and normed is not None
+      ):
+        queries = queries + self.joint_pos_mlp(normed.to(dtype=queries.dtype))
+      cross_attn_bias = None
+      if self.use_local_cross_attn and normed is not None:
+        cross_attn_bias = self._gaussian_cross_attn_bias(
+            normed, B, memory.dtype, memory.device
+        )
+      queries = layer(
+          queries,
+          memory,
+          cond,
+          self_attn_bias=self_attn_bias,
+          cross_attn_bias=cross_attn_bias,
+      )
+      if need_layer_preds:
+        pred_x_i = self.fc_x(queries)
+        pred_y_i = self.fc_y(queries)
+        prev_pred_x, prev_pred_y = pred_x_i, pred_y_i
+        if self.deep_supervision:
+          aux_preds.append((pred_x_i, pred_y_i))
+
+    if self.deep_supervision:
+      pred_x, pred_y = aux_preds[-1]
+      early_aux = aux_preds[:-1] if len(aux_preds) > 1 else []
+      return pred_x, pred_y, early_aux
 
     pred_x = self.fc_x(queries)
     pred_y = self.fc_y(queries)
@@ -387,10 +767,83 @@ class JointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
   _layer_cls = _JointQuerySelfAttnDecoderLayer
 
 
+class CoupleJointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
+  """Paired lead|follow joint-query head (2K queries) with person-bank embeddings.
+
+  Query layout: ``[0:K)`` = lead, ``[K:2K)`` = follow. Self-attn across both banks
+  can resolve limb ownership on overlapping union crops. Role conditioning is
+  disabled — bank identity replaces ``[is_lead, is_follow]`` bits.
+  """
+
+  _layer_cls = _JointQuerySelfAttnDecoderLayer
+
+  def __init__(
+      self,
+      in_channels: int,
+      num_joints: int,
+      grid_size: IVec2,
+      out_size: IVec2,
+      split_ratio: float = 2.0,
+      neck_dim: int = 256,
+      num_heads: int = 8,
+      num_layers: int = 2,
+      dropout: float = 0.0,
+      soft_foot_anchor: bool = False,
+      soft_foot_anchor_init: float = 0.4,
+      foot_anchor_pairs: list[tuple[int, int]] | None = None,
+      person_joints: int | None = None,
+      use_role: bool = False,
+      role_film: bool = True,
+      **kwargs,
+  ):
+    if num_joints % 2 != 0:
+      raise ValueError(
+          f'Couple head expects even num_joints (2 * person_joints), got {num_joints}'
+      )
+    resolved_person_joints = (
+        int(person_joints) if person_joints is not None else num_joints // 2
+    )
+    if num_joints != 2 * resolved_person_joints:
+      raise ValueError(
+          f'num_joints ({num_joints}) must equal 2 * person_joints ({resolved_person_joints})'
+      )
+    # Bank embeddings carry identity; never enable role FiLM/bias on this head.
+    super().__init__(
+        in_channels=in_channels,
+        num_joints=num_joints,
+        grid_size=grid_size,
+        out_size=out_size,
+        split_ratio=split_ratio,
+        neck_dim=neck_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dropout=dropout,
+        soft_foot_anchor=soft_foot_anchor,
+        soft_foot_anchor_init=soft_foot_anchor_init,
+        foot_anchor_pairs=foot_anchor_pairs,
+        use_role=False,
+        role_film=False,
+        **kwargs,
+    )
+    self.person_joints = resolved_person_joints
+    self.lead_embed = nn.Parameter(torch.randn(1, 1, neck_dim) * 0.02)
+    self.follow_embed = nn.Parameter(torch.randn(1, 1, neck_dim) * 0.02)
+
+  def _build_queries(self, batch_size: int) -> torch.Tensor:
+    queries = super()._build_queries(batch_size)
+    if not self.soft_foot_anchor:
+      queries = queries.clone()
+    k = self.person_joints
+    queries[:, :k] = queries[:, :k] + self.lead_embed
+    queries[:, k:] = queries[:, k:] + self.follow_embed
+    return queries
+
+
 HEAD_REGISTRY = {
     'depthwise_simcc': DepthwiseSimCCHead,
     'joint_query_simcc': JointQuerySimCCHead,
     'joint_query_self_attn_simcc': JointQuerySelfAttnSimCCHead,
+    'couple_joint_query_self_attn_simcc': CoupleJointQuerySelfAttnSimCCHead,
 }
 
 
@@ -399,7 +852,8 @@ class DinoCC(nn.Module):
                  split_ratio: float = 2.0, neck_dim: int = 256,
                  backbone_name: str = 'facebook/dinov2-base',
                  head_name: str = 'depthwise_simcc',
-                 head_kwargs: dict | None = None):
+                 head_kwargs: dict | None = None,
+                 unfreeze_last_blocks: int | None = None):
         super().__init__()
         self.num_joints = num_joints
         self.img_size = img_size
@@ -408,8 +862,11 @@ class DinoCC(nn.Module):
 
         # Load ViT backbone (Hub id, local weights dir, or config-only dir)
         self.backbone = load_backbone(backbone_name)
-        self.patch_size = self.backbone.config.patch_size
+        self.patch_size = int(self.backbone.config.patch_size)
         self.num_register_tokens = getattr(self.backbone.config, 'num_register_tokens', 0) or 0
+        self.patch_token_start = getattr(
+            self.backbone, 'patch_token_start', 1 + self.num_register_tokens
+        )
 
         if self.img_size.x % self.patch_size != 0 or self.img_size.y % self.patch_size != 0:
             raise ValueError(
@@ -419,10 +876,7 @@ class DinoCC(nn.Module):
 
         self.grid_size = IVec2(self.img_size.x // self.patch_size, self.img_size.y // self.patch_size)
 
-        # Freeze backbone weights
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        self._configure_backbone_trainable(freeze_backbone, unfreeze_last_blocks)
 
         if head_name not in HEAD_REGISTRY:
             raise ValueError(
@@ -441,6 +895,50 @@ class DinoCC(nn.Module):
             kwargs.update(head_kwargs)
         self.head = head_cls(**kwargs)
 
+    def _configure_backbone_trainable(
+        self, freeze_backbone: bool, unfreeze_last_blocks: int | None
+    ) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = not freeze_backbone
+        if freeze_backbone or not unfreeze_last_blocks:
+            return
+
+        # Partial finetune: freeze all, then open the last N encoder blocks (+ final LN).
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        layers = None
+        layernorm = None
+        # VitPoseBackboneAdapter → inner .backbone.encoder.layer
+        inner = getattr(self.backbone, 'backbone', None)
+        if inner is not None and hasattr(getattr(inner, 'encoder', None), 'layer'):
+            layers = list(inner.encoder.layer)
+            layernorm = getattr(inner, 'layernorm', None)
+        # HF ViT / older DINO: .encoder.layer
+        elif hasattr(getattr(self.backbone, 'encoder', None), 'layer'):
+            layers = list(self.backbone.encoder.layer)
+            layernorm = getattr(self.backbone, 'layernorm', None) or getattr(
+                self.backbone, 'norm', None
+            )
+        # DINOv3: .model.layer + .norm
+        elif hasattr(getattr(self.backbone, 'model', None), 'layer'):
+            layers = list(self.backbone.model.layer)
+            layernorm = getattr(self.backbone, 'norm', None)
+
+        if layers is None:
+            raise ValueError(
+                f'unfreeze_last_blocks={unfreeze_last_blocks} but could not find '
+                f'encoder layers on backbone type {type(self.backbone).__name__}'
+            )
+
+        n = max(0, min(int(unfreeze_last_blocks), len(layers)))
+        for layer in layers[-n:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        if layernorm is not None:
+            for param in layernorm.parameters():
+                param.requires_grad = True
+
     def load_weights(self, checkpoint_path, map_location='cpu', strict=True):
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
@@ -448,30 +946,41 @@ class DinoCC(nn.Module):
         return checkpoint
 
 
-    def forward(self, pixel_values, role=None):
+    def forward(self, pixel_values, role=None, spatial=None):
         # DINOv2 needs pos-encoding interpolation for non-native resolutions; DINOv3 uses RoPE
         if getattr(self.backbone.config, 'model_type', None) == 'dinov2':
             outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
         else:
             outputs = self.backbone(pixel_values=pixel_values)
 
-        # Token 0 is [CLS]; DINOv3 (and some DINOv2 variants) insert register tokens before patches
-        patch_start = 1 + self.num_register_tokens
-        patch_tokens = outputs.last_hidden_state[:, patch_start:, :]  # [B, N, C]
+        patch_tokens = outputs.last_hidden_state[:, self.patch_token_start:, :]  # [B, N, C]
 
-        # Predict 1D coordinates
-        pred_x, pred_y = self.head(patch_tokens, role=role)
+        head_out = self.head(patch_tokens, role=role, spatial=spatial)
+        if isinstance(head_out, tuple) and len(head_out) == 3:
+            return head_out
+        pred_x, pred_y = head_out
         return pred_x, pred_y
 
 
-def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0):
+def generate_simcc_labels(
+    keypoints,
+    img_size: IVec2,
+    split_ratio=2.0,
+    sigma=6.0,
+    sigma_occluded: float | None = None,
+    occluded_weight: float = 0.35,
+):
     """
     Args:
         keypoints: Array-like of shape [K, 3] with rows: [x, y, visibility]
                    Coordinates must be relative to the cropped 336x448 image.
         img_size: IVec2(x=336, y=448)
         split_ratio: Sub-pixel scaling factor (2.0 = 0.5px bins)
-        sigma: Standard deviation of the Gaussian label distribution in bin units
+        sigma: Gaussian std (bin units) for visible joints (v==2)
+        sigma_occluded: Gaussian std for occluded joints (v==1). None → same as sigma.
+            Wider values soften the target so near-misses cost less while wild
+            misses still get KL pressure via the tails.
+        occluded_weight: Loss weight for occluded joints (v==1); visible use 1.0.
     Returns:
         target_x: [K, out_bins_x]
         target_y: [K, out_bins_y]
@@ -480,6 +989,16 @@ def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0
     num_joints = len(keypoints)
     bins_x = int(img_size.x * split_ratio)
     bins_y = int(img_size.y * split_ratio)
+    sigma = float(sigma)
+    sigma_occ = float(sigma_occluded) if sigma_occluded is not None else sigma
+    occ_w = float(occluded_weight)
+    if sigma <= 0 or sigma_occ <= 0:
+        raise ValueError(
+            f'sigma and sigma_occluded must be > 0, got sigma={sigma}, '
+            f'sigma_occluded={sigma_occ}'
+        )
+    if not 0.0 < occ_w <= 1.0:
+        raise ValueError(f'occluded_weight must be in (0, 1], got {occ_w}')
 
     target_x = np.zeros((num_joints, bins_x), dtype=np.float32)
     target_y = np.zeros((num_joints, bins_y), dtype=np.float32)
@@ -496,17 +1015,18 @@ def generate_simcc_labels(keypoints, img_size: IVec2, split_ratio=2.0, sigma=6.0
         # Scale continuous pixels to sub-pixel bin centers
         mu_x = x * split_ratio
         mu_y = y * split_ratio
+        joint_sigma = sigma if v == 2 else sigma_occ
 
         # Continuous 1D Gaussian distributions
-        gx = np.exp(-((x_bins - mu_x) ** 2) / (2.0 * sigma ** 2))
-        gy = np.exp(-((y_bins - mu_y) ** 2) / (2.0 * sigma ** 2))
+        gx = np.exp(-((x_bins - mu_x) ** 2) / (2.0 * joint_sigma ** 2))
+        gy = np.exp(-((y_bins - mu_y) ** 2) / (2.0 * joint_sigma ** 2))
 
         # Normalize to valid probability density
         target_x[k] = gx / (gx.sum() + 1e-8)
         target_y[k] = gy / (gy.sum() + 1e-8)
 
-        # Visibility weighting: full weight if visible, 0.35 if occluded by partner/clothing
-        weights[k] = 1.0 if v == 2 else 0.35
+        # Visibility weighting: full weight if visible, reduced if occluded
+        weights[k] = 1.0 if v == 2 else occ_w
 
     return (
         torch.from_numpy(target_x),
