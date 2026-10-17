@@ -90,6 +90,174 @@ def joint_xy_mix_fraction(
     return mixed / counted, counted
 
 
+def _contra_map(left_right_pairs: list[tuple[int, int]]) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    for left_i, right_i in left_right_pairs:
+        mapping[int(left_i)] = int(right_i)
+        mapping[int(right_i)] = int(left_i)
+    return mapping
+
+
+def _nearest_source(value: float, sources: dict[str, float | None]) -> str | None:
+    """Pick source name with min |value - coord|; ignore None sources."""
+    best_name = None
+    best_dist = float('inf')
+    for name, coord in sources.items():
+        if coord is None:
+            continue
+        dist = abs(value - float(coord))
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
+
+
+def classify_axis_partial_swap(
+    x_peak: float,
+    y_peak: float,
+    self_xy: tuple[float, float],
+    contra_xy: tuple[float, float] | None,
+    partner_xy: tuple[float, float] | None,
+    partner_contra_xy: tuple[float, float] | None = None,
+) -> str:
+    """Label one joint's SimCC peaks by nearest 1D sources.
+
+    Returns one of:
+      both_self, partial_lr, partial_partner, partial_partner_lr,
+      both_lr, both_partner, other
+    """
+    sx, sy = self_xy
+    x_sources: dict[str, float | None] = {'self': sx, 'contra': None, 'partner': None, 'partner_contra': None}
+    y_sources: dict[str, float | None] = {'self': sy, 'contra': None, 'partner': None, 'partner_contra': None}
+    if contra_xy is not None:
+        x_sources['contra'] = contra_xy[0]
+        y_sources['contra'] = contra_xy[1]
+    if partner_xy is not None:
+        x_sources['partner'] = partner_xy[0]
+        y_sources['partner'] = partner_xy[1]
+    if partner_contra_xy is not None:
+        x_sources['partner_contra'] = partner_contra_xy[0]
+        y_sources['partner_contra'] = partner_contra_xy[1]
+
+    x_src = _nearest_source(x_peak, x_sources)
+    y_src = _nearest_source(y_peak, y_sources)
+    if x_src is None or y_src is None:
+        return 'other'
+    if x_src == 'self' and y_src == 'self':
+        return 'both_self'
+    if {x_src, y_src} == {'self', 'contra'}:
+        return 'partial_lr'
+    if {x_src, y_src} == {'self', 'partner'}:
+        return 'partial_partner'
+    if {x_src, y_src} == {'self', 'partner_contra'}:
+        return 'partial_partner_lr'
+    if x_src == 'contra' and y_src == 'contra':
+        return 'both_lr'
+    if x_src == 'partner' and y_src == 'partner':
+        return 'both_partner'
+    return 'other'
+
+
+def axis_partial_swap_records(
+    pred_x: np.ndarray,
+    pred_y: np.ndarray,
+    self_gt: np.ndarray,
+    partner_gt: np.ndarray | None,
+    split_ratio: float,
+    left_right_pairs: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    """Per-joint axis attribution for one person crop (partner optional)."""
+    contra = _contra_map(left_right_pairs)
+    k = pred_x.shape[0]
+    rows: list[dict[str, Any]] = []
+    for j in range(k):
+        if self_gt[j, 2] <= 0:
+            continue
+        x_peak = float(np.argmax(pred_x[j]) / split_ratio)
+        y_peak = float(np.argmax(pred_y[j]) / split_ratio)
+        self_xy = (float(self_gt[j, 0]), float(self_gt[j, 1]))
+        contra_xy = None
+        cj = contra.get(j)
+        if cj is not None and self_gt[cj, 2] > 0:
+            contra_xy = (float(self_gt[cj, 0]), float(self_gt[cj, 1]))
+        partner_xy = None
+        partner_contra_xy = None
+        if partner_gt is not None and partner_gt[j, 2] > 0:
+            partner_xy = (float(partner_gt[j, 0]), float(partner_gt[j, 1]))
+            if cj is not None and partner_gt[cj, 2] > 0:
+                partner_contra_xy = (float(partner_gt[cj, 0]), float(partner_gt[cj, 1]))
+        label = classify_axis_partial_swap(
+            x_peak, y_peak, self_xy, contra_xy, partner_xy, partner_contra_xy
+        )
+        rows.append(
+            {
+                'joint': j,
+                'label': label,
+                'has_contra': contra_xy is not None,
+                'has_partner_joint': partner_xy is not None,
+            }
+        )
+    return rows
+
+
+def summarize_axis_partial_swaps(
+    joint_rows: list[dict[str, Any]],
+    *,
+    joint_names: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """Aggregate axis-partial-swap labels (global + per-joint)."""
+    labels = (
+        'both_self',
+        'partial_lr',
+        'partial_partner',
+        'partial_partner_lr',
+        'both_lr',
+        'both_partner',
+        'other',
+    )
+    n = len(joint_rows)
+    counts = {lab: 0 for lab in labels}
+    for row in joint_rows:
+        counts[row['label']] = counts.get(row['label'], 0) + 1
+
+    def rate(name: str) -> float | None:
+        return (counts[name] / n) if n else None
+
+    partial_any = counts['partial_lr'] + counts['partial_partner'] + counts['partial_partner_lr']
+    out: dict[str, Any] = {
+        'num_joints': n,
+        'rates': {lab: rate(lab) for lab in labels},
+        'counts': counts,
+        'partial_any_rate': (partial_any / n) if n else None,
+        'partial_lr_rate': rate('partial_lr'),
+        'partial_partner_rate': rate('partial_partner'),
+        'partial_partner_lr_rate': rate('partial_partner_lr'),
+    }
+
+    by_joint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in joint_rows:
+        key = joint_names.get(row['joint'], str(row['joint'])) if joint_names else str(row['joint'])
+        by_joint[key].append(row)
+    per_joint = {}
+    for name, rows in by_joint.items():
+        nj = len(rows)
+        c = defaultdict(int)
+        for r in rows:
+            c[r['label']] += 1
+        per_joint[name] = {
+            'n': nj,
+            'partial_lr': c['partial_lr'] / nj if nj else 0.0,
+            'partial_partner': c['partial_partner'] / nj if nj else 0.0,
+            'partial_partner_lr': c['partial_partner_lr'] / nj if nj else 0.0,
+            'partial_any': (c['partial_lr'] + c['partial_partner'] + c['partial_partner_lr']) / nj
+            if nj
+            else 0.0,
+            'both_self': c['both_self'] / nj if nj else 0.0,
+        }
+    out['per_joint'] = per_joint
+    return out
+
+
 def _ownership_rate_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     n = len(rows)
     if n == 0:

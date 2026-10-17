@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Stage code + checkpoint into deploy/nuclio before `nuctl deploy`.
+# Stage code + checkpoint into deploy/nuclio and sync to cvat_annotation_tools.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANNOTATION_TOOLS_DEST="${ANNOTATION_TOOLS_DEST:-${ROOT}/../cvat_annotation_tools/nuclio/dinocc}"
+DEFAULT_CHECKPOINT="${ROOT}/training/runs/2026_10_09_007/best.pt"
 
 CHECKPOINT="${1:-}"
 if [[ -z "${CHECKPOINT}" ]]; then
-  CHECKPOINT="$(ls -1dt "${ROOT}"/training/runs/*/best.pt 2>/dev/null | head -1 || true)"
+  if [[ -f "${DEFAULT_CHECKPOINT}" ]]; then
+    CHECKPOINT="${DEFAULT_CHECKPOINT}"
+  else
+    CHECKPOINT="$(ls -1dt "${ROOT}"/training/runs/*/best.pt 2>/dev/null | head -1 || true)"
+  fi
 fi
 if [[ -z "${CHECKPOINT}" || ! -f "${CHECKPOINT}" ]]; then
   echo "Usage: $0 [path/to/best.pt]" >&2
@@ -16,11 +22,11 @@ if [[ -z "${CHECKPOINT}" || ! -f "${CHECKPOINT}" ]]; then
 fi
 
 echo "Syncing model code from repo root..."
+mkdir -p "${DEST}/mapping" "${DEST}/weights" "${DEST}/backbone"
 cp -f "${ROOT}/dino_cc.py" "${DEST}/dino_cc.py"
 cp -f "${ROOT}/vec.py" "${DEST}/vec.py"
 cp -f "${ROOT}/mapping/dance_23.yaml" "${DEST}/mapping/dance_23.yaml"
 
-mkdir -p "${DEST}/weights" "${DEST}/backbone"
 echo "Copying checkpoint: ${CHECKPOINT}"
 CHECKPOINT_ABS="$(cd "$(dirname "${CHECKPOINT}")" && pwd)/$(basename "${CHECKPOINT}")"
 DEST_CKPT="${DEST}/weights/best.pt"
@@ -76,9 +82,28 @@ rm -f "${DEST}/backbone"/model.safetensors \
       "${DEST}/backbone"/model.bin \
       "${DEST}/backbone"/model.pt
 
+# Sync into cvat_annotation_tools for deploy_gpu.sh (expects function-gpu.yaml).
+if [[ -d "$(dirname "${ANNOTATION_TOOLS_DEST}")" ]]; then
+  echo "Syncing to annotation-tools: ${ANNOTATION_TOOLS_DEST}"
+  mkdir -p "${ANNOTATION_TOOLS_DEST}/mapping" \
+           "${ANNOTATION_TOOLS_DEST}/weights" \
+           "${ANNOTATION_TOOLS_DEST}/backbone"
+  cp -f "${DEST}/main.py" "${ANNOTATION_TOOLS_DEST}/main.py"
+  cp -f "${DEST}/dino_cc.py" "${ANNOTATION_TOOLS_DEST}/dino_cc.py"
+  cp -f "${DEST}/vec.py" "${ANNOTATION_TOOLS_DEST}/vec.py"
+  cp -f "${DEST}/mapping/dance_23.yaml" "${ANNOTATION_TOOLS_DEST}/mapping/dance_23.yaml"
+  cp -f "${DEST}/function_gpu.yaml" "${ANNOTATION_TOOLS_DEST}/function-gpu.yaml"
+  cp -f "${DEST}/weights/best.pt" "${ANNOTATION_TOOLS_DEST}/weights/best.pt"
+  cp -f "${DEST}/backbone/config.json" "${ANNOTATION_TOOLS_DEST}/backbone/config.json"
+else
+  echo "WARN: annotation-tools parent missing; skipped sync to ${ANNOTATION_TOOLS_DEST}" >&2
+fi
+
 du -h "${DEST}/weights/best.pt" "${DEST}/backbone/config.json"
 cat <<EOF
 Ready. Deploy with:
+  ~/cvat/serverless/deploy_gpu.sh ${ANNOTATION_TOOLS_DEST}
+# or:
   nuctl deploy --project-name cvat \\
     --path ${DEST} \\
     --file ${DEST}/function_gpu.yaml \\

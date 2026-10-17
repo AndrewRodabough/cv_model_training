@@ -2,7 +2,18 @@
 dataset:
   name: XXXXX
   annotation_version: X.X.X
-  
+  # Optional: mix COCO-WholeBody into single-person training (dance-only val).
+  # coco_wholebody:
+  #   enabled: true
+  #   ann_file: /path/to/coco_wholebody_train_v1.0.json
+  #   image_root: /path/to/train2017
+  #   dance_fraction: 0.25
+  #   max_samples: null
+  #   rolling: false  # true = resample COCO subset each epoch from the valid pool
+  #   min_labeled_joints: 5
+  #   proxy_glabella_from_nose: true
+  #   proxy_heel_spike_from_heel: true
+ 
 image:
   width: XXXXX <px>
   height: XXXXX <px>

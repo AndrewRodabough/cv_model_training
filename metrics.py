@@ -105,6 +105,14 @@ def compute_oks(
             to occluded or visible joints only. Returns None when the person has no
             joints in the selected class (caller should omit from AP).
     """
+    pred_xy = np.asarray(pred_xy)
+    gt_xyv = np.asarray(gt_xyv)
+    sigmas = np.asarray(sigmas)
+    if pred_xy.shape[0] != gt_xyv.shape[0] or sigmas.shape[0] != gt_xyv.shape[0]:
+        raise ValueError(
+            f'OKS shape mismatch: pred={pred_xy.shape[0]} gt={gt_xyv.shape[0]} '
+            f'sigmas={sigmas.shape[0]}'
+        )
     if visibility_eq is None:
         mask = gt_xyv[:, 2] > 0
     else:
@@ -115,6 +123,23 @@ def compute_oks(
     dist_sq = np.sum(delta * delta, axis=-1)
     denom = 2.0 * (scale ** 2) * (sigmas[mask] ** 2) + 1e-9
     return float(np.exp(-dist_sq / denom).mean())
+
+
+def align_keypoints_to_num_joints(keypoints: np.ndarray, num_joints: int) -> np.ndarray:
+    """Pad (v=0) or truncate keypoint rows to ``num_joints``.
+
+    dance_20 is a prefix of dance_23 (body+feet, then head), so padding shorter
+    arrays with invisible head joints is safe for that layout.
+    """
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    if keypoints.ndim != 2 or keypoints.shape[1] < 3:
+        raise ValueError(f'Expected [K, 3+] keypoints, got {keypoints.shape}')
+    if keypoints.shape[0] == num_joints:
+        return keypoints
+    out = np.zeros((num_joints, keypoints.shape[1]), dtype=np.float32)
+    n = min(num_joints, keypoints.shape[0])
+    out[:n] = keypoints[:n]
+    return out
 
 
 def joint_score_for_visibility(

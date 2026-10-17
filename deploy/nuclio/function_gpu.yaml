@@ -1,6 +1,6 @@
 metadata:
   name: pth-dinocc-dance-23
-  namespace: nuclio
+  namespace: cvat
   annotations:
     name: DinoCC Dance 23
     type: detector

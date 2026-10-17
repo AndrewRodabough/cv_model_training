@@ -37,7 +37,7 @@ def build_frame_index(annotation_file: Path, task_ids: set[str]):
         if video.get('id') not in task_ids:
             continue
         for frame in video.findall('frame'):
-            image_path = image_root / frame.get('image')
+            image_path = (image_root / frame.get('image')).resolve()
             for person in frame.findall('person'):
                 kps, bbox, role = t.parse_person(person)
                 index[image_path].append((kps, bbox, role))

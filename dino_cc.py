@@ -19,7 +19,14 @@ def load_backbone(backbone_name: str):
   A local directory with only ``config.json`` (no weight files) uses
   ``from_config`` so deploy packages can ship architecture metadata and load
   weights exclusively from a training checkpoint.
+
+  VitPose / VitPose++ Hub ids (``*vitpose*``) return a
+  :class:`VitPoseBackboneAdapter` that exposes DINO-like
+  ``last_hidden_state`` patch tokens for the SimCC head.
   """
+  if 'vitpose' in Path(backbone_name).name.lower() or 'vitpose' in backbone_name.lower():
+    return VitPoseBackboneAdapter.from_pretrained(backbone_name)
+
   backbone_path = Path(backbone_name)
   if backbone_path.is_dir():
     config = AutoConfig.from_pretrained(backbone_path)
@@ -28,6 +35,121 @@ def load_backbone(backbone_name: str):
       return AutoModel.from_pretrained(backbone_path)
     return AutoModel.from_config(config)
   return AutoModel.from_pretrained(backbone_name)
+
+
+class _VitPoseTokenOutput(NamedTuple):
+  last_hidden_state: torch.Tensor
+
+
+class VitPoseBackboneAdapter(nn.Module):
+  """Wrap HF VitPose(+)/++ backbone as DINO-style patch tokens.
+
+  Training crops are ``[0, 1]`` float CHW (same as the DINO path). This adapter
+  applies ImageNet mean/std, runs the VitPose backbone (MoE expert 0 for ++),
+  and bicubic-interpolates absolute pos embeds when crop size ≠ native 256×192.
+  """
+
+  IMAGENET_MEAN = (0.485, 0.456, 0.406)
+  IMAGENET_STD = (0.229, 0.224, 0.225)
+
+  def __init__(self, backbone: nn.Module, dataset_index: int = 0):
+    super().__init__()
+    self.backbone = backbone
+    self.dataset_index = int(dataset_index)
+    # Patch tokens only (no CLS/register prefix) — DinoCC uses patch_token_start.
+    self.patch_token_start = 0
+
+    bb_cfg = backbone.config
+    patch = bb_cfg.patch_size
+    if isinstance(patch, (list, tuple)):
+      if patch[0] != patch[1]:
+        raise ValueError(f'VitPose non-square patch_size unsupported: {patch}')
+      patch_size = int(patch[0])
+    else:
+      patch_size = int(patch)
+
+    # Minimal config surface expected by DinoCC / train.py checks.
+    self.config = type('VitPoseAdapterConfig', (), {})()
+    self.config.model_type = 'vitpose_backbone'
+    self.config.hidden_size = int(bb_cfg.hidden_size)
+    self.config.patch_size = patch_size
+    self.config.num_register_tokens = 0
+    self.config.num_experts = int(getattr(bb_cfg, 'num_experts', 1) or 1)
+    image_size = bb_cfg.image_size
+    if isinstance(image_size, (list, tuple)):
+      self.config.native_image_size = (int(image_size[0]), int(image_size[1]))
+    else:
+      self.config.native_image_size = (int(image_size), int(image_size))
+
+    mean = torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1)
+    self.register_buffer('_mean', mean, persistent=False)
+    self.register_buffer('_std', std, persistent=False)
+
+  @classmethod
+  def from_pretrained(cls, model_id: str, dataset_index: int = 0):
+    from transformers import VitPoseForPoseEstimation
+
+    full = VitPoseForPoseEstimation.from_pretrained(model_id)
+    return cls(full.backbone, dataset_index=dataset_index)
+
+  def _interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Bicubic-resize absolute pos embeds to the current patch grid."""
+    patch_size = self.config.patch_size
+    # Conv padding=2 → same closed-form grid as VitPosePatchEmbeddings at native size.
+    grid_h = (height + 4 - patch_size) // patch_size + 1
+    grid_w = (width + 4 - patch_size) // patch_size + 1
+    pos = self.backbone.embeddings.position_embeddings  # [1, N+1, C]
+    cls_pos = pos[:, :1]
+    patch_pos = pos[:, 1:]
+    native_h, native_w = self.config.native_image_size
+    native_gh = (native_h + 4 - patch_size) // patch_size + 1
+    native_gw = (native_w + 4 - patch_size) // patch_size + 1
+    if grid_h == native_gh and grid_w == native_gw:
+      return embeddings + patch_pos + cls_pos
+
+    dim = patch_pos.shape[-1]
+    patch_pos = patch_pos.reshape(1, native_gh, native_gw, dim).permute(0, 3, 1, 2)
+    patch_pos = F.interpolate(patch_pos, size=(grid_h, grid_w), mode='bicubic', align_corners=False)
+    patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, dim)
+    return embeddings + patch_pos + cls_pos
+
+  def forward(self, pixel_values: torch.Tensor, **kwargs):
+    # Pipeline feeds [0, 1]; VitPose was trained with ImageNet normalization.
+    pixel_values = (pixel_values - self._mean) / self._std
+    height, width = pixel_values.shape[-2:]
+
+    # Bypass hard size check + inject interpolated pos embeds.
+    patch_embeds = self.backbone.embeddings.patch_embeddings.projection(pixel_values)
+    patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+    embedding_output = self.backbone.embeddings.dropout(
+        self._interpolate_pos_encoding(patch_embeds, height, width)
+    )
+
+    dataset_index = None
+    if self.config.num_experts > 1:
+      dataset_index = torch.full(
+          (pixel_values.shape[0],),
+          self.dataset_index,
+          device=pixel_values.device,
+          dtype=torch.long,
+      )
+
+    outputs = self.backbone.encoder(
+        embedding_output,
+        dataset_index=dataset_index,
+        output_hidden_states=True,
+    )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+      raise RuntimeError('VitPose encoder returned no hidden_states')
+    feature_maps = []
+    for stage, hidden_state in zip(self.backbone.stage_names, hidden_states):
+      if stage in self.backbone.out_features:
+        feature_maps.append(self.backbone.layernorm(hidden_state))
+    if not feature_maps:
+      raise RuntimeError('VitPose backbone produced no feature maps')
+    return _VitPoseTokenOutput(last_hidden_state=feature_maps[-1])
 
 class BaseSimCCHead(nn.Module, ABC):
   """Formal interface for any SimCC head variant."""
@@ -730,7 +852,8 @@ class DinoCC(nn.Module):
                  split_ratio: float = 2.0, neck_dim: int = 256,
                  backbone_name: str = 'facebook/dinov2-base',
                  head_name: str = 'depthwise_simcc',
-                 head_kwargs: dict | None = None):
+                 head_kwargs: dict | None = None,
+                 unfreeze_last_blocks: int | None = None):
         super().__init__()
         self.num_joints = num_joints
         self.img_size = img_size
@@ -739,8 +862,11 @@ class DinoCC(nn.Module):
 
         # Load ViT backbone (Hub id, local weights dir, or config-only dir)
         self.backbone = load_backbone(backbone_name)
-        self.patch_size = self.backbone.config.patch_size
+        self.patch_size = int(self.backbone.config.patch_size)
         self.num_register_tokens = getattr(self.backbone.config, 'num_register_tokens', 0) or 0
+        self.patch_token_start = getattr(
+            self.backbone, 'patch_token_start', 1 + self.num_register_tokens
+        )
 
         if self.img_size.x % self.patch_size != 0 or self.img_size.y % self.patch_size != 0:
             raise ValueError(
@@ -750,10 +876,7 @@ class DinoCC(nn.Module):
 
         self.grid_size = IVec2(self.img_size.x // self.patch_size, self.img_size.y // self.patch_size)
 
-        # Freeze backbone weights
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        self._configure_backbone_trainable(freeze_backbone, unfreeze_last_blocks)
 
         if head_name not in HEAD_REGISTRY:
             raise ValueError(
@@ -772,6 +895,50 @@ class DinoCC(nn.Module):
             kwargs.update(head_kwargs)
         self.head = head_cls(**kwargs)
 
+    def _configure_backbone_trainable(
+        self, freeze_backbone: bool, unfreeze_last_blocks: int | None
+    ) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = not freeze_backbone
+        if freeze_backbone or not unfreeze_last_blocks:
+            return
+
+        # Partial finetune: freeze all, then open the last N encoder blocks (+ final LN).
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        layers = None
+        layernorm = None
+        # VitPoseBackboneAdapter → inner .backbone.encoder.layer
+        inner = getattr(self.backbone, 'backbone', None)
+        if inner is not None and hasattr(getattr(inner, 'encoder', None), 'layer'):
+            layers = list(inner.encoder.layer)
+            layernorm = getattr(inner, 'layernorm', None)
+        # HF ViT / older DINO: .encoder.layer
+        elif hasattr(getattr(self.backbone, 'encoder', None), 'layer'):
+            layers = list(self.backbone.encoder.layer)
+            layernorm = getattr(self.backbone, 'layernorm', None) or getattr(
+                self.backbone, 'norm', None
+            )
+        # DINOv3: .model.layer + .norm
+        elif hasattr(getattr(self.backbone, 'model', None), 'layer'):
+            layers = list(self.backbone.model.layer)
+            layernorm = getattr(self.backbone, 'norm', None)
+
+        if layers is None:
+            raise ValueError(
+                f'unfreeze_last_blocks={unfreeze_last_blocks} but could not find '
+                f'encoder layers on backbone type {type(self.backbone).__name__}'
+            )
+
+        n = max(0, min(int(unfreeze_last_blocks), len(layers)))
+        for layer in layers[-n:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        if layernorm is not None:
+            for param in layernorm.parameters():
+                param.requires_grad = True
+
     def load_weights(self, checkpoint_path, map_location='cpu', strict=True):
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
@@ -786,9 +953,7 @@ class DinoCC(nn.Module):
         else:
             outputs = self.backbone(pixel_values=pixel_values)
 
-        # Token 0 is [CLS]; DINOv3 (and some DINOv2 variants) insert register tokens before patches
-        patch_start = 1 + self.num_register_tokens
-        patch_tokens = outputs.last_hidden_state[:, patch_start:, :]  # [B, N, C]
+        patch_tokens = outputs.last_hidden_state[:, self.patch_token_start:, :]  # [B, N, C]
 
         head_out = self.head(patch_tokens, role=role, spatial=spatial)
         if isinstance(head_out, tuple) and len(head_out) == 3:

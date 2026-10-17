@@ -1,5 +1,6 @@
 import argparse
 import csv
+import gc
 import random
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from dino_cc import DinoCC, SimCCLoss, generate_simcc_labels
 from metrics import (
+    align_keypoints_to_num_joints,
     body_part_oks_fields,
     compute_oks,
     decode_simcc,
@@ -27,6 +29,13 @@ from metrics import (
     resolve_body_part_indices,
     summarize_pose_metrics,
     write_metrics_json,
+)
+from coco_wholebody_dataset import (
+    CocoWholeBodyConfig,
+    build_coco_wholebody_samples,
+    mean_labeled_joints,
+    mix_dance_with_coco,
+    target_coco_count,
 )
 
 from vec import IVec2
@@ -76,7 +85,8 @@ class StdoutCsvTee:
 class DatasetConfig:
     name: str
     annotation_version: str
-    annotation_file: str 
+    annotation_file: str
+    coco_wholebody: CocoWholeBodyConfig | None = None
 
 @dataclass
 class ImageConfig:
@@ -90,6 +100,15 @@ class BackboneConfig:
     type: str
     patch_size: int
     hidden_size: int
+    # If True, backbone params are frozen. If False, train all (or last N blocks).
+    freeze: bool = True
+    # When freeze=False: if set, only the last N encoder blocks (+ LN) are trainable.
+    unfreeze_last_blocks: int | None = None
+    # Optional backbone LR (AdamW param group). None → training.learning_rate when
+    # fully frozen head-only; when backbone is trainable defaults to 0.1× head LR.
+    learning_rate: float | None = None
+    # VitPose++ MoE expert index (COCO=0). Ignored for non-MoE backbones.
+    dataset_index: int = 0
 
 @dataclass
 class HeadConfig:
@@ -206,10 +225,21 @@ class TrainingConfig:
     # Single-person only: drop samples whose max IoU with another person in-frame
     # exceeds this. None = no filter. Solo people count as IoU 0.
     max_partner_iou: float | None = None
+    # Single-person only: drop samples whose max IoU with another person in-frame
+    # is below this. None = no filter. Solo people (IoU 0) are dropped when set.
+    min_partner_iou: float | None = None
     # Phase A: weight on L1 bone-vector loss (0 = off). Applied on soft-decoded SimCC coords.
     bone_loss_weight: float = 0.0
     # Penalize L/R joint assignment when swapped assignment fits GT better (0 = off).
     lr_swap_loss_weight: float = 0.0
+    # Margin (fraction of image diagonal) for joint L/R swap hinge.
+    lr_swap_margin: float = 0.02
+    # Chirality: relu(-cos(pred_R-L, gt_R-L)) on L/R pairs with enough GT separation.
+    chirality_loss_weight: float = 0.0
+    # Skip chirality when ||gt_R - gt_L|| / image_diag is below this (closed feet).
+    chirality_min_sep: float = 0.03
+    # What drives best.pt + early stopping: val_loss (default) or ap (OKS-AP on test).
+    checkpoint_metric: str = 'val_loss'
 
 @dataclass
 class keypoint_mapping:
@@ -248,12 +278,16 @@ COUPLE_MODE = False
 COUPLE_MIN_IOU = 0.3
 COUPLE_HEAD_NAME = 'couple_joint_query_self_attn_simcc'
 MAX_PARTNER_IOU: float | None = None
+MIN_PARTNER_IOU: float | None = None
 USE_SPATIAL_PROMPT = False
 DEEP_SUPERVISION = False
 DEEP_SUPERVISION_AUX_WEIGHT = 0.5
 XY_CONSISTENCY_LOSS_WEIGHT = 0.0
 BONE_LOSS_WEIGHT = 0.0
 LR_SWAP_LOSS_WEIGHT = 0.0
+LR_SWAP_MARGIN = 0.02
+CHIRALITY_LOSS_WEIGHT = 0.0
+CHIRALITY_MIN_SEP = 0.03
 BONE_PAIRS: torch.Tensor = torch.empty(0, 2, dtype=torch.long)
 
 # Directed skeleton edges used for bone-vector loss and overlays (name → name).
@@ -393,7 +427,10 @@ class KeypointDataset(Dataset):
         self.repeats = repeats if training else 1
         if samples is None:
             samples = build_person_samples(
-                annotation_file, task_ids, max_partner_iou=MAX_PARTNER_IOU
+                annotation_file,
+                task_ids,
+                max_partner_iou=MAX_PARTNER_IOU,
+                min_partner_iou=MIN_PARTNER_IOU,
             )
 
         self.samples = list(samples)
@@ -461,12 +498,14 @@ def build_person_samples(
     annotation_file: Path,
     task_ids,
     max_partner_iou: float | None = None,
+    min_partner_iou: float | None = None,
 ):
-    """Build single-person samples; optionally drop high partner-overlap cases.
+    """Build single-person samples; optionally filter by partner-overlap IoU.
 
     Each sample is ``(image_path, keypoints, bbox, role)``.
     When ``max_partner_iou`` is set, keep a person only if their max IoU with any
     other person in the same frame is ``<= max_partner_iou`` (solo → IoU 0).
+    When ``min_partner_iou`` is set, keep only if that max IoU is ``>= min_partner_iou``.
     """
     root = ET.parse(annotation_file).getroot()
     image_root = Path(annotation_file).parent
@@ -489,13 +528,16 @@ def build_person_samples(
                 people.append((keypoints, bbox, role))
             for index, (keypoints, bbox, role) in enumerate(people):
                 n_total += 1
-                if max_partner_iou is not None:
+                if max_partner_iou is not None or min_partner_iou is not None:
                     partner_iou = 0.0
                     for other_i, (_ok, other_bbox, _or) in enumerate(people):
                         if other_i == index:
                             continue
                         partner_iou = max(partner_iou, bbox_iou(bbox, other_bbox))
-                    if partner_iou > max_partner_iou:
+                    if max_partner_iou is not None and partner_iou > max_partner_iou:
+                        n_dropped += 1
+                        continue
+                    if min_partner_iou is not None and partner_iou < min_partner_iou:
                         n_dropped += 1
                         continue
                 samples.append((image_path, keypoints, bbox, role))
@@ -503,15 +545,17 @@ def build_person_samples(
         raise ValueError(
             f'No person samples for task IDs {sorted(task_ids)}'
             + (
-                f' after max_partner_iou={max_partner_iou} filter '
-                f'(dropped {n_dropped}/{n_total})'
-                if max_partner_iou is not None
+                f' after partner IoU filter '
+                f'(max={max_partner_iou}, min={min_partner_iou}; '
+                f'dropped {n_dropped}/{n_total})'
+                if max_partner_iou is not None or min_partner_iou is not None
                 else ''
             )
         )
-    if max_partner_iou is not None:
+    if max_partner_iou is not None or min_partner_iou is not None:
         print(
-            f'Person IoU filter max_partner_iou={max_partner_iou}: '
+            f'Person IoU filter max_partner_iou={max_partner_iou} '
+            f'min_partner_iou={min_partner_iou}: '
             f'kept {len(samples)}/{n_total}, dropped {n_dropped}'
         )
     return samples
@@ -796,9 +840,11 @@ def setup_from_config(config):
     global OCCLUDED_JOINT_WEIGHT
     global LEFT_RIGHT_PAIRS, JOINT_LOSS_WEIGHTS, OKS_SIGMAS
     global AUG_SCALE_MIN, AUG_SCALE_MAX, AUG_SHIFT_FRAC, AUG_ROTATION_DEG, AUG_COLOR_JITTER
-    global USE_ROLE, ROLE_DROPOUT, COUPLE_MODE, COUPLE_MIN_IOU, MAX_PARTNER_IOU
+    global USE_ROLE, ROLE_DROPOUT, COUPLE_MODE, COUPLE_MIN_IOU
+    global MAX_PARTNER_IOU, MIN_PARTNER_IOU
     global USE_SPATIAL_PROMPT, DEEP_SUPERVISION, DEEP_SUPERVISION_AUX_WEIGHT
-    global XY_CONSISTENCY_LOSS_WEIGHT, BONE_LOSS_WEIGHT, LR_SWAP_LOSS_WEIGHT, BONE_PAIRS
+    global XY_CONSISTENCY_LOSS_WEIGHT, BONE_LOSS_WEIGHT, LR_SWAP_LOSS_WEIGHT, LR_SWAP_MARGIN
+    global CHIRALITY_LOSS_WEIGHT, CHIRALITY_MIN_SEP, BONE_PAIRS
 
     image_cfg: ImageConfig = config['image']
     head_cfg: HeadConfig = config['head']
@@ -843,6 +889,7 @@ def setup_from_config(config):
         ROLE_DROPOUT = 0.0
         COUPLE_MIN_IOU = float(getattr(head_cfg.custom, 'couple_min_iou', 0.3))
         MAX_PARTNER_IOU = None
+        MIN_PARTNER_IOU = None
         if not 0.0 <= COUPLE_MIN_IOU <= 1.0:
             raise ValueError(f'couple_min_iou must be in [0, 1], got {COUPLE_MIN_IOU}')
     else:
@@ -860,6 +907,24 @@ def setup_from_config(config):
                 raise ValueError(
                     f'max_partner_iou must be in [0, 1], got {MAX_PARTNER_IOU}'
                 )
+        min_partner = getattr(training_cfg, 'min_partner_iou', None)
+        if min_partner is None:
+            MIN_PARTNER_IOU = None
+        else:
+            MIN_PARTNER_IOU = float(min_partner)
+            if not 0.0 <= MIN_PARTNER_IOU <= 1.0:
+                raise ValueError(
+                    f'min_partner_iou must be in [0, 1], got {MIN_PARTNER_IOU}'
+                )
+        if (
+            MAX_PARTNER_IOU is not None
+            and MIN_PARTNER_IOU is not None
+            and MIN_PARTNER_IOU > MAX_PARTNER_IOU
+        ):
+            raise ValueError(
+                f'min_partner_iou ({MIN_PARTNER_IOU}) cannot exceed '
+                f'max_partner_iou ({MAX_PARTNER_IOU})'
+            )
         custom = head_cfg.custom
         USE_SPATIAL_PROMPT = bool(getattr(custom, 'use_spatial_prompt', False))
         DEEP_SUPERVISION = bool(getattr(custom, 'deep_supervision', False))
@@ -889,6 +954,22 @@ def setup_from_config(config):
     LR_SWAP_LOSS_WEIGHT = float(getattr(training_cfg, 'lr_swap_loss_weight', 0.0))
     if LR_SWAP_LOSS_WEIGHT < 0:
         raise ValueError(f'lr_swap_loss_weight must be >= 0, got {LR_SWAP_LOSS_WEIGHT}')
+    LR_SWAP_MARGIN = float(getattr(training_cfg, 'lr_swap_margin', 0.02))
+    if LR_SWAP_MARGIN < 0:
+        raise ValueError(f'lr_swap_margin must be >= 0, got {LR_SWAP_MARGIN}')
+    CHIRALITY_LOSS_WEIGHT = float(getattr(training_cfg, 'chirality_loss_weight', 0.0))
+    if CHIRALITY_LOSS_WEIGHT < 0:
+        raise ValueError(f'chirality_loss_weight must be >= 0, got {CHIRALITY_LOSS_WEIGHT}')
+    CHIRALITY_MIN_SEP = float(getattr(training_cfg, 'chirality_min_sep', 0.03))
+    if CHIRALITY_MIN_SEP < 0:
+        raise ValueError(f'chirality_min_sep must be >= 0, got {CHIRALITY_MIN_SEP}')
+    checkpoint_metric = str(getattr(training_cfg, 'checkpoint_metric', 'val_loss')).lower()
+    if checkpoint_metric not in ('val_loss', 'ap'):
+        raise ValueError(
+            f"checkpoint_metric must be 'val_loss' or 'ap', got {training_cfg.checkpoint_metric!r}"
+        )
+    if checkpoint_metric == 'ap' and not training_cfg.compute_ap:
+        raise ValueError('checkpoint_metric=ap requires compute_ap=true')
 
     ordered = sorted(head_cfg.keypoints.items(), key=lambda item: item[1]['id'])
     local_ids = [meta['id'] for _, meta in ordered]
@@ -1271,15 +1352,26 @@ def lr_swap_assignment_loss(
     pred_xy: torch.Tensor,
     gt_keypoints: torch.Tensor,
     left_right_pairs: list[tuple[int, int]],
+    margin: float | None = None,
 ) -> torch.Tensor:
-    """Penalize when swapped L/R assignment fits GT better than the correct one."""
+    """Joint margin hinge: penalize when full L/R swap fits GT better than correct.
+
+    Aggregates L1 over all valid pairs, then
+    ``relu((d_correct - d_swapped) / diag + margin)`` so a partial/full swap
+    that beats the correct assignment is expensive, while mushy ties still get
+    a margin push toward the labeled side.
+    """
     if not left_right_pairs:
         return pred_xy.new_zeros(())
+    margin = LR_SWAP_MARGIN if margin is None else float(margin)
     gt_xy = gt_keypoints[..., :2].to(device=pred_xy.device, dtype=pred_xy.dtype)
     vis = gt_keypoints[..., 2].to(device=pred_xy.device)
     diag = (IMAGE_SIZE.x ** 2 + IMAGE_SIZE.y ** 2) ** 0.5
     scale = max(float(diag), 1e-6)
-    losses = []
+
+    d_correct = pred_xy.new_zeros(pred_xy.shape[0])
+    d_swapped = pred_xy.new_zeros(pred_xy.shape[0])
+    pair_count = pred_xy.new_zeros(pred_xy.shape[0])
     for left_i, right_i in left_right_pairs:
         valid = (vis[:, left_i] > 0) & (vis[:, right_i] > 0)
         if not bool(valid.any()):
@@ -1288,11 +1380,54 @@ def lr_swap_assignment_loss(
         pred_r = pred_xy[:, right_i]
         gt_l = gt_xy[:, left_i]
         gt_r = gt_xy[:, right_i]
-        d_correct = (pred_l - gt_l).abs().sum(dim=-1) + (pred_r - gt_r).abs().sum(dim=-1)
-        d_swapped = (pred_l - gt_r).abs().sum(dim=-1) + (pred_r - gt_l).abs().sum(dim=-1)
-        # softplus(d_correct - d_swapped): large when swap fits better
-        pair_loss = torch.nn.functional.softplus((d_correct - d_swapped) / scale)
-        losses.append(pair_loss[valid].mean())
+        correct = (pred_l - gt_l).abs().sum(dim=-1) + (pred_r - gt_r).abs().sum(dim=-1)
+        swapped = (pred_l - gt_r).abs().sum(dim=-1) + (pred_r - gt_l).abs().sum(dim=-1)
+        d_correct = d_correct + correct * valid.float()
+        d_swapped = d_swapped + swapped * valid.float()
+        pair_count = pair_count + valid.float()
+
+    has_pairs = pair_count > 0
+    if not bool(has_pairs.any()):
+        return pred_xy.new_zeros(())
+    # Normalize by #pairs so margin is comparable across visibility patterns.
+    d_correct = d_correct / pair_count.clamp(min=1.0)
+    d_swapped = d_swapped / pair_count.clamp(min=1.0)
+    hinge = torch.relu((d_correct - d_swapped) / scale + margin)
+    return hinge[has_pairs].mean()
+
+
+def lr_chirality_loss(
+    pred_xy: torch.Tensor,
+    gt_keypoints: torch.Tensor,
+    left_right_pairs: list[tuple[int, int]],
+    min_sep: float | None = None,
+) -> torch.Tensor:
+    """Push L/R vectors to match GT orientation: ``relu(-cos(pred_R-L, gt_R-L))``.
+
+    Skips pairs whose GT separation is below ``min_sep * image_diag`` so closed
+    feet do not inject noisy chirality gradients.
+    """
+    if not left_right_pairs:
+        return pred_xy.new_zeros(())
+    min_sep = CHIRALITY_MIN_SEP if min_sep is None else float(min_sep)
+    gt_xy = gt_keypoints[..., :2].to(device=pred_xy.device, dtype=pred_xy.dtype)
+    vis = gt_keypoints[..., 2].to(device=pred_xy.device)
+    diag = max((IMAGE_SIZE.x ** 2 + IMAGE_SIZE.y ** 2) ** 0.5, 1e-6)
+    min_norm = min_sep * diag
+
+    losses = []
+    for left_i, right_i in left_right_pairs:
+        valid = (vis[:, left_i] > 0) & (vis[:, right_i] > 0)
+        gt_vec = gt_xy[:, right_i] - gt_xy[:, left_i]
+        gt_norm = gt_vec.norm(dim=-1)
+        valid = valid & (gt_norm >= min_norm)
+        if not bool(valid.any()):
+            continue
+        pred_vec = pred_xy[:, right_i] - pred_xy[:, left_i]
+        pred_norm = pred_vec.norm(dim=-1).clamp(min=1e-6)
+        cos = (pred_vec * gt_vec).sum(dim=-1) / (pred_norm * gt_norm.clamp(min=1e-6))
+        # 0 when aligned (cos>0), up to 1 when fully anti-aligned (swapped).
+        losses.append(torch.relu(-cos)[valid].mean())
     if not losses:
         return pred_xy.new_zeros(())
     return torch.stack(losses).mean()
@@ -1330,20 +1465,23 @@ def compute_simcc_training_loss(
         loss = loss + XY_CONSISTENCY_LOSS_WEIGHT * simcc_xy_consistency_loss(
             pred_x, pred_y, target_x, target_y, weights
         )
-    if BONE_LOSS_WEIGHT > 0 and gt_keypoints is not None:
+    need_xy = gt_keypoints is not None and (
+        BONE_LOSS_WEIGHT > 0 or LR_SWAP_LOSS_WEIGHT > 0 or CHIRALITY_LOSS_WEIGHT > 0
+    )
+    if need_xy:
         pred_xy = soft_decode_simcc_coords(pred_x, pred_y, SIMCC_SPLIT_RATIO)
-        loss = loss + BONE_LOSS_WEIGHT * bone_vector_loss(
-            pred_xy, gt_keypoints, BONE_PAIRS
-        )
+        if BONE_LOSS_WEIGHT > 0:
+            loss = loss + BONE_LOSS_WEIGHT * bone_vector_loss(
+                pred_xy, gt_keypoints, BONE_PAIRS
+            )
         if LR_SWAP_LOSS_WEIGHT > 0:
             loss = loss + LR_SWAP_LOSS_WEIGHT * lr_swap_assignment_loss(
                 pred_xy, gt_keypoints, LEFT_RIGHT_PAIRS
             )
-    elif LR_SWAP_LOSS_WEIGHT > 0 and gt_keypoints is not None:
-        pred_xy = soft_decode_simcc_coords(pred_x, pred_y, SIMCC_SPLIT_RATIO)
-        loss = loss + LR_SWAP_LOSS_WEIGHT * lr_swap_assignment_loss(
-            pred_xy, gt_keypoints, LEFT_RIGHT_PAIRS
-        )
+        if CHIRALITY_LOSS_WEIGHT > 0:
+            loss = loss + CHIRALITY_LOSS_WEIGHT * lr_chirality_loss(
+                pred_xy, gt_keypoints, LEFT_RIGHT_PAIRS
+            )
     return loss
 
 
@@ -1468,11 +1606,16 @@ def parse_config(raw_config):
     backbone_cfg = BackboneConfig(**raw_config['backbone'])
     training_cfg = TrainingConfig(**raw_config['training'])
 
+    dataset_raw = dict(raw_config['dataset'])
+    coco_raw = dataset_raw.pop('coco_wholebody', None)
+    coco_cfg = CocoWholeBodyConfig.from_raw(coco_raw)
+    coco_cfg.validate()
 
-    dataset_cfg = DatasetConfig(**raw_config['dataset'], annotation_file='')
+    dataset_cfg = DatasetConfig(**dataset_raw, annotation_file='', coco_wholebody=coco_cfg)
     annotation_path = Path('annotations')
-    dataset_cfg.annotation_file = str(annotation_path / f'annotations_{dataset_cfg.annotation_version}.xml')
-
+    dataset_cfg.annotation_file = str(
+        annotation_path / f'annotations_{dataset_cfg.annotation_version}.xml'
+    )
 
     head_cfg = HeadConfig(**raw_config['head'], keypoints={})
     keypoint_format = load_keypoint_format(head_cfg.keypoint_format_name)
@@ -1497,6 +1640,12 @@ def parse_config(raw_config):
                 f"'joint_query_self_attn_simcc', or 'couple_joint_query_self_attn_simcc'"
             )
 
+    if coco_cfg.enabled and head_cfg.name == 'couple_joint_query_self_attn_simcc':
+        raise ValueError(
+            'coco_wholebody mixing is only supported for single-person heads '
+            '(not couple_joint_query_self_attn_simcc)'
+        )
+
     return {
         'dataset': dataset_cfg,
         'image': image_cfg,
@@ -1509,6 +1658,8 @@ def parse_config(raw_config):
 BACKBONE_HF_IDS = {
     'dino_v2_base': 'facebook/dinov2-base',
     'dino_v3_base': 'facebook/dinov3-vitb16-pretrain-lvd1689m',
+    'vitpose_plus_base': 'usyd-community/vitpose-plus-base',
+    'vitpose_base': 'usyd-community/vitpose-base',
 }
 
 
@@ -1518,7 +1669,7 @@ def build_model(config, device):
     backbone_cfg: BackboneConfig = config['backbone']
 
     match backbone_cfg.name:
-        case 'dino_v2_base' | 'dino_v3_base':
+        case 'dino_v2_base' | 'dino_v3_base' | 'vitpose_plus_base' | 'vitpose_base':
             match head_cfg.type:
                 case 'simcc':
                     joint_query_heads = (
@@ -1532,22 +1683,53 @@ def build_model(config, device):
                         head_kwargs = build_depthwise_head_kwargs(head_cfg)
                     else:
                         head_kwargs = {}
-                    return DinoCC(
+                    model = DinoCC(
                         NUM_JOINTS,
                         IMAGE_SIZE,
-                        freeze_backbone=True,
+                        freeze_backbone=backbone_cfg.freeze,
                         split_ratio=SIMCC_SPLIT_RATIO,
                         neck_dim=head_cfg.out_channels,
                         backbone_name=BACKBONE_HF_IDS[backbone_cfg.name],
                         head_name=head_cfg.name,
                         head_kwargs=head_kwargs,
+                        unfreeze_last_blocks=(
+                            None if backbone_cfg.freeze else backbone_cfg.unfreeze_last_blocks
+                        ),
                     ).to(device)
+                    if hasattr(model.backbone, 'dataset_index'):
+                        model.backbone.dataset_index = int(backbone_cfg.dataset_index)
+                    return model
                 case _:
                     raise ValueError(
                         f'Unsupported head type for backbone {backbone_cfg.name}: {head_cfg.type}'
                     )
         case _:
             raise ValueError(f'Unsupported backbone type: {backbone_cfg.name}')
+
+
+def build_optimizer(model, training_cfg: TrainingConfig, backbone_cfg: BackboneConfig):
+    """AdamW with optional lower LR for trainable backbone params."""
+    head_lr = training_cfg.learning_rate
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith('backbone.')]
+    if backbone_params:
+        backbone_lr = (
+            backbone_cfg.learning_rate
+            if backbone_cfg.learning_rate is not None
+            else head_lr * 0.1
+        )
+        param_groups = [
+            {'params': backbone_params, 'lr': backbone_lr},
+            {'params': head_params, 'lr': head_lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=training_cfg.weight_decay)
+        return optimizer, backbone_lr
+    optimizer = torch.optim.AdamW(
+        head_params,
+        lr=head_lr,
+        weight_decay=training_cfg.weight_decay,
+    )
+    return optimizer, None
 
 
 def load_test_samples(config):
@@ -1561,7 +1743,10 @@ def load_test_samples(config):
         full_samples = build_couple_samples(annotation_file, set(task_ids), COUPLE_MIN_IOU)
     else:
         full_samples = build_person_samples(
-            annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
+            annotation_file,
+            set(task_ids),
+            max_partner_iou=MAX_PARTNER_IOU,
+            min_partner_iou=MIN_PARTNER_IOU,
         )
     full_samples = cap_samples_per_clip(
         full_samples,
@@ -1833,12 +2018,17 @@ def evaluate_checkpoint_metrics(
     batch_size,
     annotation_version: str | None = None,
 ):
-    """Score best/final checkpoint with OKS-AP (primary) and custom suites."""
+    """Score best/final checkpoint with OKS-AP (primary) and custom suites.
+
+    If ``checkpoint_path`` is None, evaluates the current in-memory weights
+    (used for per-epoch AP checkpoint selection).
+    """
     if OKS_SIGMAS.numel() == 0:
         raise ValueError('OKS_SIGMAS is empty; keypoint format must define oks_sigmas')
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     sigmas = OKS_SIGMAS.detach().cpu().numpy()
@@ -2068,15 +2258,18 @@ def _ownership_metric_record(
     from eval_ownership import is_same_person
     from ownership_metrics import iou_bucket, joint_xy_mix_fraction, pick_partner
 
-    image_path = Path(item['image_path'])
+    image_path = Path(item['image_path']).resolve()
     self_bbox = item['bbox']
     people = frame_index.get(image_path, [])
+    if not people:
+        # Fall back to unresolved path keys from older indexes.
+        people = frame_index.get(Path(item['image_path']), [])
     others = [
         (kps, bbox, role)
         for kps, bbox, role in people
         if not is_same_person(bbox, self_bbox)
     ]
-    crop_kps = item['crop_kps']
+    crop_kps = align_keypoints_to_num_joints(item['crop_kps'], pred_xy.shape[0])
     oks_self = compute_oks(pred_xy, crop_kps, sigmas, item['scale'])
     partner_ctx = pick_partner(self_bbox, others)
     if partner_ctx is None:
@@ -2095,9 +2288,10 @@ def _ownership_metric_record(
         }
 
     cx1, cy1, cw, ch = item['crop_geom']
-    partner_crop = transform_keypoints_to_crop(
-        partner_ctx.partner_kps, cx1, cy1, cw, ch
+    partner_kps = align_keypoints_to_num_joints(
+        partner_ctx.partner_kps, pred_xy.shape[0]
     )
+    partner_crop = transform_keypoints_to_crop(partner_kps, cx1, cy1, cw, ch)
     partner_scale = person_scale_in_crop(
         partner_ctx.partner_bbox, cw, ch, IMAGE_SIZE.x, IMAGE_SIZE.y
     )
@@ -2192,7 +2386,10 @@ def _run_training(args, config, run_dir, run_config_path):
         full_samples = build_couple_samples(annotation_file, set(task_ids), COUPLE_MIN_IOU)
     else:
         full_samples = build_person_samples(
-            annotation_file, set(task_ids), max_partner_iou=MAX_PARTNER_IOU
+            annotation_file,
+            set(task_ids),
+            max_partner_iou=MAX_PARTNER_IOU,
+            min_partner_iou=MIN_PARTNER_IOU,
         )
     full_samples = cap_samples_per_clip(
         full_samples,
@@ -2206,11 +2403,67 @@ def _run_training(args, config, run_dir, run_config_path):
         split_mode=training_cfg.split_mode,
         test_clips=getattr(training_cfg, 'test_clips', None),
     )
-    split_index = len(train_image_paths)
-    image_paths = train_image_paths + test_image_paths
-    train_clips = sorted({clip_id_from_image_path(path) for path in train_image_paths})
+    n_dance_train = len(train_samples)
+    n_coco_train = 0
+    coco_cfg = getattr(dataset_cfg, 'coco_wholebody', None)
+    coco_rolling = bool(coco_cfg is not None and coco_cfg.enabled and coco_cfg.rolling)
+    dance_train_only = list(train_samples)
+    coco_pool: list = []
+    if coco_cfg is not None and coco_cfg.enabled:
+        if COUPLE_MODE:
+            raise ValueError(
+                'coco_wholebody mixing requires a single-person head '
+                '(not couple_joint_query_self_attn_simcc)'
+            )
+        target_coco = target_coco_count(n_dance_train, coco_cfg.dance_fraction)
+        # Rolling keeps the full valid pool (max_samples still caps it); fixed mode
+        # reservoir-samples down to the per-epoch target once at startup.
+        build_target = None if coco_rolling else (target_coco if target_coco > 0 else None)
+        coco_pool = build_coco_wholebody_samples(
+            coco_cfg,
+            head_cfg.keypoints,
+            PERSON_JOINTS,
+            seed=training_cfg.seed,
+            target_count=build_target,
+        )
+        if coco_rolling:
+            gc.collect()
+        train_samples, n_coco_train = mix_dance_with_coco(
+            dance_train_only,
+            coco_pool,
+            coco_cfg.dance_fraction,
+            seed=training_cfg.seed + 17 + (1 if coco_rolling else 0),
+        )
+        missing_images = [
+            path for path, *_ in coco_pool[: min(32, len(coco_pool))] if not Path(path).is_file()
+        ]
+        if missing_images:
+            raise FileNotFoundError(
+                f'COCO image(s) missing (showing up to 32): {missing_images[:5]}'
+            )
+        dance_labeled = mean_labeled_joints(dance_train_only)
+        realized = n_dance_train / max(1, len(train_samples))
+        print(
+            f'COCO mix: rolling={coco_rolling}, dance_train={n_dance_train}, '
+            f'coco_pool={len(coco_pool)}, coco_per_epoch={n_coco_train}, '
+            f'total_train={len(train_samples)}, realized_dance_fraction={realized:.3f} '
+            f'(target={coco_cfg.dance_fraction:.3f}); '
+            f'mean_labeled_joints dance={dance_labeled:.1f} '
+            f'coco_pool={mean_labeled_joints(coco_pool):.1f}'
+        )
+
+    dance_train_image_paths = list(train_image_paths)
+    split_index = len(dance_train_image_paths)
+    image_paths = dance_train_image_paths + test_image_paths
+    train_clips = sorted({clip_id_from_image_path(path) for path in dance_train_image_paths})
     test_clips = sorted({clip_id_from_image_path(path) for path in test_image_paths})
     split_label = f'{training_cfg.train_test_split:.2f} by {training_cfg.split_mode}'
+    if n_coco_train:
+        rolling_tag = ', rolling' if coco_rolling else ''
+        split_label += (
+            f' + coco_wholebody (dance_frac≈{n_dance_train / len(train_samples):.2f}'
+            f'{rolling_tag})'
+        )
     dataset_cls = CoupleKeypointDataset if COUPLE_MODE else KeypointDataset
     train_dataset = dataset_cls(
         annotation_file,
@@ -2224,7 +2477,15 @@ def _run_training(args, config, run_dir, run_config_path):
         set(task_ids),
         samples=test_samples,
     )
-    train_loader = make_loader(train_dataset, training_cfg.batch_size, args.workers)
+    # Rolling keeps a large COCO pool in-process. Prefer a couple workers for GPU
+    # feed rate; cap hard so we don't multiply the ~130k-sample pool into an OOM.
+    train_workers = min(2, args.workers) if coco_rolling else args.workers
+    if coco_rolling and train_workers != args.workers:
+        print(
+            f'COCO rolling: using train_workers={train_workers} '
+            f'(requested --workers={args.workers}) with pool={len(coco_pool)}'
+        )
+    train_loader = make_loader(train_dataset, training_cfg.batch_size, train_workers)
     test_loader = make_loader(test_dataset, training_cfg.batch_size, args.workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2263,27 +2524,28 @@ def _run_training(args, config, run_dir, run_config_path):
         'couple_mode': COUPLE_MODE,
         'couple_min_iou': COUPLE_MIN_IOU if COUPLE_MODE else None,
         'max_partner_iou': MAX_PARTNER_IOU,
+        'min_partner_iou': MIN_PARTNER_IOU,
         'person_joints': PERSON_JOINTS,
     }
 
 
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=training_cfg.learning_rate,
-        weight_decay=training_cfg.weight_decay,
-    )
+    optimizer, backbone_lr = build_optimizer(model, training_cfg, backbone_cfg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_cfg.max_epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
+    checkpoint_metric = str(getattr(training_cfg, 'checkpoint_metric', 'val_loss')).lower()
     best_val_loss = float('inf')
+    best_val_ap = -1.0
     epochs_without_improvement = 0
     best_path = run_dir / 'best.pt'
     couple_msg = (
         f' couple_mode=True couple_min_iou={COUPLE_MIN_IOU} pair_samples={len(full_samples)}'
         if COUPLE_MODE
         else (
-            f' max_partner_iou={MAX_PARTNER_IOU} person_samples={len(full_samples)}'
-            if MAX_PARTNER_IOU is not None
+            f' max_partner_iou={MAX_PARTNER_IOU}'
+            f' min_partner_iou={MIN_PARTNER_IOU}'
+            f' person_samples={len(full_samples)}'
+            if MAX_PARTNER_IOU is not None or MIN_PARTNER_IOU is not None
             else f' person_samples={len(full_samples)}'
         )
     )
@@ -2291,6 +2553,14 @@ def _run_training(args, config, run_dir, run_config_path):
         f'; init_checkpoint={Path(args.init_checkpoint).resolve()}'
         if getattr(args, 'init_checkpoint', None)
         else ''
+    )
+    bb_train = sum(p.requires_grad for p in model.backbone.parameters())
+    bb_total = sum(1 for _ in model.backbone.parameters())
+    backbone_msg = (
+        f' backbone={backbone_cfg.name} freeze={backbone_cfg.freeze}'
+        f' unfreeze_last_blocks={backbone_cfg.unfreeze_last_blocks}'
+        f' trainable_tensors={bb_train}/{bb_total}'
+        f'{"" if backbone_lr is None else f" backbone_lr={backbone_lr}"}'
     )
     print(
         f'Training on {device}; split_mode={training_cfg.split_mode}; '
@@ -2300,21 +2570,61 @@ def _run_training(args, config, run_dir, run_config_path):
         f'use_role={USE_ROLE} role_dropout={ROLE_DROPOUT if USE_ROLE else 0.0}; '
         f'bone_loss_weight={BONE_LOSS_WEIGHT}; '
         f'lr_swap_loss_weight={LR_SWAP_LOSS_WEIGHT}; '
+        f'lr_swap_margin={LR_SWAP_MARGIN}; '
+        f'chirality_loss_weight={CHIRALITY_LOSS_WEIGHT}; '
+        f'chirality_min_sep={CHIRALITY_MIN_SEP}; '
+        f'checkpoint_metric={checkpoint_metric}; '
         f'lr={training_cfg.learning_rate}; '
         f'simcc_sigma={SIMCC_SIGMA}'
         f'{"" if SIMCC_SIGMA_OCCLUDED is None else f"/{SIMCC_SIGMA_OCCLUDED}_occ"}; '
         f'occ_weight={OCCLUDED_JOINT_WEIGHT}; '
-        f'num_joints={NUM_JOINTS}{couple_msg}{init_msg}'
+        f'num_joints={NUM_JOINTS}{couple_msg}{backbone_msg}{init_msg}'
     )
 
     for epoch in range(1, training_cfg.max_epochs + 1):
+        if coco_rolling:
+            train_samples, n_coco_train = mix_dance_with_coco(
+                dance_train_only,
+                coco_pool,
+                coco_cfg.dance_fraction,
+                seed=training_cfg.seed + 17 + epoch,
+            )
+            train_dataset.samples = train_samples
+            train_loader = make_loader(train_dataset, training_cfg.batch_size, train_workers)
+            print(
+                f'COCO rolling: epoch={epoch:03d} coco={n_coco_train}/{len(coco_pool)} '
+                f'total_train={len(train_samples)}'
+            )
         train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler, True, training_cfg.gradient_clip_norm)
         val_loss = run_epoch(model, test_loader, criterion, optimizer, device, scaler, False, training_cfg.gradient_clip_norm)
         scheduler.step()
-        print(f'Epoch {epoch:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}')
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        val_ap = None
+        if checkpoint_metric == 'ap':
+            # Skip ownership suite during the epoch loop for speed.
+            val_metrics = evaluate_checkpoint_metrics(
+                model,
+                checkpoint_path=None,
+                test_samples=test_samples,
+                device=device,
+                batch_size=training_cfg.batch_size,
+                annotation_version=None,
+            )
+            val_ap = float(val_metrics['AP'])
+            print(
+                f'Epoch {epoch:03d} | train_loss={train_loss:.5f} | '
+                f'val_loss={val_loss:.5f} | val_AP={val_ap:.4f}'
+            )
+            improved = val_ap > best_val_ap + 1e-6
+        else:
+            print(f'Epoch {epoch:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}')
+            improved = val_loss < best_val_loss
+
+        if improved:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+            if val_ap is not None and val_ap > best_val_ap:
+                best_val_ap = val_ap
             epochs_without_improvement = 0
             torch.save(
                 {
@@ -2334,18 +2644,24 @@ def _run_training(args, config, run_dir, run_config_path):
                     'couple_mode': head_checkpoint_meta['couple_mode'],
                     'couple_min_iou': head_checkpoint_meta['couple_min_iou'],
                     'max_partner_iou': head_checkpoint_meta['max_partner_iou'],
+                    'min_partner_iou': head_checkpoint_meta['min_partner_iou'],
                     'config_path': str(run_config_path),
                     'seed': training_cfg.seed,
                     'split': split_label,
                     'epoch': epoch,
                     'val_loss': val_loss,
+                    'val_ap': val_ap,
+                    'checkpoint_metric': checkpoint_metric,
                 },
                 best_path,
             )
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= training_cfg.early_stopping_patience:
-                print(f"Early stopping after {training_cfg.early_stopping_patience} epochs without improvement.")
+                print(
+                    f'Early stopping after {training_cfg.early_stopping_patience} epochs '
+                    f'without {checkpoint_metric} improvement.'
+                )
                 break
 
     final_path = run_dir / 'final.pt'
@@ -2367,6 +2683,7 @@ def _run_training(args, config, run_dir, run_config_path):
             'couple_mode': head_checkpoint_meta['couple_mode'],
             'couple_min_iou': head_checkpoint_meta['couple_min_iou'],
             'max_partner_iou': head_checkpoint_meta['max_partner_iou'],
+            'min_partner_iou': head_checkpoint_meta['min_partner_iou'],
             'config_path': str(run_config_path),
             'seed': training_cfg.seed,
             'split': split_label,

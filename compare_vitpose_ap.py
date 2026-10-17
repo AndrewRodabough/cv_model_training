@@ -281,10 +281,12 @@ def evaluate_best_pt(
         target_x, target_y, weights = train_mod.make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(
+            model_out = model(
                 pixels_tensor,
                 role=role_tensor if train_mod.USE_ROLE else None,
             )
+            # Deep-supervision heads return (pred_x, pred_y, aux); use primary only.
+            pred_x, pred_y = model_out[0], model_out[1]
             sample_losses = train_mod.per_sample_simcc_loss(
                 pred_x, pred_y, target_x, target_y, weights
             )
