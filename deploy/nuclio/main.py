@@ -228,7 +228,8 @@ def handler(context, event):
                 role_tensor = (
                     encode_role(role).unsqueeze(0).to(device) if use_role else None
                 )
-                pred_x, pred_y = model(pixels, role=role_tensor)
+                model_out = model(pixels, role=role_tensor)
+                pred_x, pred_y = model_out[0], model_out[1]
                 coords, conf = decode_simcc(pred_x[0], pred_y[0], split_ratio)
                 coords = coords.cpu().numpy()
                 conf = conf.cpu().numpy()

@@ -1,0 +1,33 @@
+# Primary label policy: union lead/follow (or couple_id) boxes when IoU >= threshold.
+# Export first:
+#   python export_bbox_detection.py --annotation-version 1.7.0 --union-iou-threshold 0.3
+
+dataset:
+  annotation_version: 1.7.0
+  # Relative to repo root after export_bbox_detection.py
+  data_yaml: dataset/detection/1.7.0/union_iou0.3/data.yaml
+  # Re-export knobs (used by train_detector --export)
+  union_iou_threshold: 0.3
+  always_separate: false
+  train_ratio: 0.8
+  min_track_length: 10
+  # frame_stride: null
+
+model:
+  # Ultralytics pretrained checkpoint name or path
+  name: yolo11m.pt
+  imgsz: 640
+
+training:
+  seed: 44
+  epochs: 80
+  batch_size: 4
+  workers: 4
+  patience: 20
+  # Ultralytics default lr; override if needed
+  # lr0: 0.01
+  # NMS IoU during val (higher keeps overlapping people)
+  iou: 0.7
+  conf: 0.25
+  project: training/detector_runs
+  run_name: bbox_union_iou0.3
