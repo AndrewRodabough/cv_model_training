@@ -1,0 +1,14 @@
+annotation_version: 1.0.1
+image_version: 0
+export_version: '2026_10_14_000'
+date: 2026-10-19
+description: new
+changes:
+  - a
+  - a
+  - a
+statistics:
+  frames_used: 3934
+  tasks_used: x
+  tracks: 59
+  track_frames: 7199

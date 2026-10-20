@@ -1,0 +1,16 @@
+annotation_version: 1.0.0
+image_version: 1.0.3
+export_version: 2026_10_06_000
+
+date: 2026-10-06
+
+description: initial release of detector annotations
+
+changes:
+  - separate detector annotations
+
+statistics:
+  frames_used: X
+  tasks_used: X
+  tracks: X
+  track_frames: X

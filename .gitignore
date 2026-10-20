@@ -1,13 +1,24 @@
-/weights
+# IDE files
 /.vscode
 /__pycache__
-/training
+
+# config files
+/config_detector.yaml
+/config_pose.yaml
+
+/weights
 /temp
-/config.yaml
+
+# large files
 *.pt
 *.safetensors
 *.jpg
 *.png
+*.pyc
+
+# runs
+/runs
+
 deploy/nuclio/weights/*.pt
 deploy/nuclio/__pycache__/
 !deploy/nuclio/weights/.gitkeep
