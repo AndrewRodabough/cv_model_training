@@ -90,7 +90,12 @@ def shape_should_include(shape, start_frame, track_id, task_id=None):
         completion = int(raw_completion) if raw_completion is not None else 0
     except ValueError:
         completion = None
-    frame = int(shape.get('frame'))
+    frame_value = shape.get('frame')
+    if frame_value is None:
+        raise ValueError(
+            f'Skeleton shape on track {track_id} is missing its frame'
+        )
+    frame = int(frame_value)
     relative_frame = frame - start_frame
     task_bit = f' in task {task_id}' if task_id is not None else ''
     if completion is None or completion <= 0:
@@ -142,7 +147,12 @@ def load_project(annotations_file: Path):
     if meta is None:
         raise ValueError('The annotations XML does not contain a meta element.')
     project = next(project for project in meta.findall('project') if project.findtext('id') == '1')
-    tasks = {task.findtext('id'): task for task in project.findall('./tasks/task')}
+    tasks = {}
+    for task in project.findall('./tasks/task'):
+        task_id = task.findtext('id')
+        if task_id is None:
+            raise ValueError('Project task is missing its id')
+        tasks[task_id] = task
     return root, project, tasks
 
 
@@ -273,7 +283,12 @@ def build_annotations(
             ):
                 continue
 
-            frame = int(shape.get('frame'))
+            frame_value = shape.get('frame')
+            if frame_value is None:
+                raise ValueError(
+                    f'Skeleton shape on track {track.get("id")} is missing its frame'
+                )
+            frame = int(frame_value)
             relative_frame = frame - start_frame
             bbox_track = bbox_for_skeleton[track.get('id')]
             bbox_shape = next((candidate for candidate in bbox_track if candidate.get('frame') == str(frame)), None)

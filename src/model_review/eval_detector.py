@@ -15,6 +15,7 @@ import json
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -87,15 +88,27 @@ def load_skeleton_keypoints(cleaned_xml: Path) -> dict[tuple[str, int], list[tup
     out: dict[tuple[str, int], list] = defaultdict(list)
     for video in root.findall('.//video'):
         task_id = video.get('id')
+        if task_id is None:
+            raise ValueError('Annotation video is missing its task ID')
         for frame in video.findall('frame'):
-            frame_number = int(frame.get('number'))
+            frame_value = frame.get('number')
+            if frame_value is None:
+                raise ValueError(f'Annotation frame in task {task_id} is missing its number')
+            frame_number = int(frame_value)
             for person in frame.findall('person'):
                 for kp in person.findall('keypoint'):
                     vis = int(kp.get('visibility', '0'))
                     if vis <= 0:
                         continue
+                    x_value = kp.get('x')
+                    y_value = kp.get('y')
+                    if x_value is None or y_value is None:
+                        raise ValueError(
+                            f'Keypoint in task {task_id}, frame {frame_number} '
+                            'is missing coordinates'
+                        )
                     out[(task_id, frame_number)].append(
-                        (float(kp.get('x')), float(kp.get('y')), vis)
+                        (float(x_value), float(y_value), vis)
                     )
     return out
 
@@ -108,17 +121,20 @@ def run_predictions(weights: Path, image_paths: list[Path], conf: float, iou: fl
             'ultralytics is required. Install with: pip install ultralytics'
         ) from exc
 
-    model = YOLO(str(weights))
+    model: Any = YOLO(str(weights))
     kwargs = {'conf': conf, 'iou': iou, 'verbose': False}
     if device is not None:
         kwargs['device'] = device
     preds_by_name: dict[str, list[tuple[float, float, float, float]]] = {}
     for path in image_paths:
-        result = model.predict(source=str(path), **kwargs)[0]
-        boxes = []
+        result = next(iter(model.predict(source=str(path), **kwargs)))
+        boxes: list[tuple[float, float, float, float]] = []
         if result.boxes is not None and len(result.boxes):
             xyxy = result.boxes.xyxy.cpu().tolist()
-            boxes = [tuple(map(float, row)) for row in xyxy]
+            boxes = [
+                (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+                for row in xyxy
+            ]
         preds_by_name[path.name] = boxes
     return preds_by_name
 
@@ -382,7 +398,7 @@ def main():
 
     cleaned_xml = args.cleaned_xml
     if cleaned_xml is None and args.data is not None:
-        # Detector evaluation uses the corresponding pose version's cleaned annotations.
+        # Legacy data.yaml evaluation can still locate its detector annotations.
         parts = Path(args.data).resolve().parts
         version = None
         if 'detection' in parts:
@@ -390,8 +406,6 @@ def main():
             if idx + 1 < len(parts):
                 version = parts[idx + 1]
         if version:
-            from src.util.get_version import get_pose_estimator_version_folder
-
             from src.util.get_version import get_detector_annotation_file
 
             try:

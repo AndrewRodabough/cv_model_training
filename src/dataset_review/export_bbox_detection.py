@@ -20,7 +20,6 @@ from pathlib import Path
 
 from src.dataset_review.dataset_parser import (
     IMAGES_DIR,
-    attribute_is_true,
     attribute_value,
     load_project,
     shape_should_include,
@@ -115,7 +114,7 @@ def collect_cleaned_person_boxes(
     frame_stride: int | None,
 ):
     """Return frames dict: (task_id, relative_frame) -> list of person dicts."""
-    root, _project, tasks = load_project(annotations_file)
+    root, _, tasks = load_project(annotations_file)
     starts = task_start_frames(tasks)
     task_names = {tid: tasks[tid].findtext('name', '') for tid in tasks}
 
@@ -159,7 +158,10 @@ def collect_cleaned_person_boxes(
             if not shape_should_include(shape, start_frame, track_id, task_id=task_id):
                 continue
 
-            global_frame = int(shape.get('frame'))
+            frame_value = shape.get('frame')
+            if frame_value is None:
+                continue
+            global_frame = int(frame_value)
             relative_frame = global_frame - start_frame
             if frame_stride is not None and frame_stride > 1:
                 if relative_frame % frame_stride != 0:
@@ -209,7 +211,7 @@ def greedy_lead_follow_pairs(people: list[dict]) -> list[tuple[dict, dict]]:
     candidates.sort(key=lambda item: item[0], reverse=True)
     used = set()
     pairs = []
-    for _iou, lead, follow in candidates:
+    for _, lead, follow in candidates:
         lead_key = id(lead)
         follow_key = id(follow)
         if lead_key in used or follow_key in used:
@@ -233,14 +235,14 @@ def pair_people(people: list[dict]) -> list[tuple[dict, dict]]:
 
     pairs = []
     leftovers = list(unpaired)
-    for _cid, group in by_couple.items():
+    for _, group in by_couple.items():
         if len(group) == 2:
             pairs.append((group[0], group[1]))
         elif len(group) > 2:
             # Prefer lead/follow within the couple group; leftover stay separate.
             group_pairs = greedy_lead_follow_pairs(group)
             pairs.extend(group_pairs)
-            paired_ids = {id(a) for a, b in group_pairs} | {id(b) for a, b in group_pairs}
+            paired_ids = {id(person) for pair in group_pairs for person in pair}
             leftovers.extend(p for p in group if id(p) not in paired_ids)
         else:
             leftovers.extend(group)
@@ -287,7 +289,7 @@ def apply_label_policy(
 
     pairs = pair_people(people)
     stats['pairs'] = len(pairs)
-    paired_ids = {id(a) for a, b in pairs} | {id(b) for a, b in pairs}
+    paired_ids = {id(person) for pair in pairs for person in pair}
     boxes = []
     tau = float(union_iou_threshold)
     soft_low = tau - soft_band
@@ -301,10 +303,12 @@ def apply_label_policy(
             stats['soft_pairs'] += 1
             # Deterministic per-frame/pair coin flip so re-exports are stable.
             rng = random.Random(
-                (
-                    decision_key if decision_key is not None else ('soft',),
-                    pair_index,
-                    round(iou, 4),
+                repr(
+                    (
+                        decision_key if decision_key is not None else ('soft',),
+                        pair_index,
+                        round(iou, 4),
+                    )
                 )
             )
             do_union = rng.random() < 0.5

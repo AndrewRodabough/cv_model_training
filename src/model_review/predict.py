@@ -80,12 +80,11 @@ def crop_image(image, bbox):
     )
 
 
-def prepare_image(image, crop_info):
-    crop_x1, crop_y1, crop_width, crop_height = crop_info
+def prepare_image(image, _crop_info):
     resized = image.resize((IMAGE_SIZE.x, IMAGE_SIZE.y), Image.Resampling.BILINEAR)
     pixels = torch.from_numpy(np.asarray(resized, dtype=np.float32)).permute(2, 0, 1) / 255.0
     pixels = (pixels - IMAGE_MEAN) / IMAGE_STD
-    return pixels.unsqueeze(0), crop_info
+    return pixels.unsqueeze(0), _crop_info
 
 
 def draw_prediction(
@@ -192,7 +191,7 @@ def main():
         neck_dim=checkpoint.get('neck_dim', 256),
         split_ratio=checkpoint.get('split_ratio', 2.0),
     ).to(device)
-    model.load_weights(args.weights, map_location=device)
+    model.load_weights(args.weights, map_location=str(device))
     model.eval()
 
     image = Image.open(args.image).convert('RGB')

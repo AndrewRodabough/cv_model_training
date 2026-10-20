@@ -2,7 +2,6 @@ from argparse import ArgumentParser
 import gc
 import random
 import shutil
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -315,7 +314,10 @@ def build_person_samples(
         if video.get('id') not in task_ids:
             continue
         for frame in video.findall('frame'):
-            image_path = image_root / frame.get('image')
+            image_name = frame.get('image')
+            if image_name is None:
+                raise ValueError('Frame is missing its image attribute')
+            image_path = image_root / image_name
             people = []
             for person in frame.findall('person'):
                 keypoints, bbox, role = parse_person(person)
@@ -329,7 +331,7 @@ def build_person_samples(
                 n_total += 1
                 if max_partner_iou is not None or min_partner_iou is not None:
                     partner_iou = 0.0
-                    for other_i, (_ok, other_bbox, _or) in enumerate(people):
+                    for other_i, (_, other_bbox, _) in enumerate(people):
                         if other_i == index:
                             continue
                         partner_iou = max(partner_iou, bbox_iou(bbox, other_bbox))
@@ -373,7 +375,10 @@ def build_couple_samples(annotation_file: Path, task_ids, min_iou: float):
         if video.get('id') not in task_ids:
             continue
         for frame in video.findall('frame'):
-            image_path = image_root / frame.get('image')
+            image_name = frame.get('image')
+            if image_name is None:
+                raise ValueError('Frame is missing its image attribute')
+            image_path = image_root / image_name
             leads = []
             follows = []
             for person in frame.findall('person'):
@@ -437,9 +442,9 @@ class CoupleKeypointDataset(Dataset):
             lead_kps,
             follow_kps,
             union_box,
-            _lead_bbox,
-            _follow_bbox,
-            _iou,
+            _,
+            _,
+            _,
         ) = self.samples[index % len(self.samples)]
         image = Image.open(image_path).convert('RGB')
         original_width, original_height = image.size
@@ -918,6 +923,7 @@ def cap_samples_per_clip(samples, max_frames_per_clip: int | None, seed: int):
     When a clip exceeds the cap, frames are chosen evenly along sorted frame
     index (deterministic; ``seed`` reserved for future random modes).
     """
+    del seed
     if max_frames_per_clip is None:
         return samples
     if max_frames_per_clip < 1:
@@ -1268,6 +1274,7 @@ def compute_simcc_training_loss(
         BONE_LOSS_WEIGHT > 0 or LR_SWAP_LOSS_WEIGHT > 0 or CHIRALITY_LOSS_WEIGHT > 0
     )
     if need_xy:
+        assert gt_keypoints is not None
         pred_xy = soft_decode_simcc_coords(pred_x, pred_y, SIMCC_SPLIT_RATIO)
         if BONE_LOSS_WEIGHT > 0:
             loss = loss + BONE_LOSS_WEIGHT * bone_vector_loss(
@@ -1639,7 +1646,7 @@ def rank_test_samples_by_loss(model, samples, device, batch_size):
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y, _aux = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
+            pred_x, pred_y, _ = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
 
         coordinates = torch.stack(
@@ -1804,7 +1811,11 @@ def evaluate_checkpoint_metrics(
 
         annotation_file = get_annotation_file_path(annotation_version)
         root = ET.parse(annotation_file).getroot()
-        task_ids = {video.get('id') for video in root.findall('./project/videos/video')}
+        task_ids = {
+            task_id
+            for video in root.findall('./project/videos/video')
+            if (task_id := video.get('id')) is not None
+        }
         frame_index = build_frame_index(annotation_file, task_ids)
 
     for start in range(0, len(test_samples), batch_size):
@@ -1824,7 +1835,7 @@ def evaluate_checkpoint_metrics(
                     union_box,
                     lead_bbox,
                     follow_bbox,
-                    _iou,
+                    _,
                 ) = sample
                 image = Image.open(image_path).convert('RGB')
                 crop_x1, crop_y1, crop_width, crop_height = compute_padded_crop(
@@ -1904,7 +1915,7 @@ def evaluate_checkpoint_metrics(
         target_x, target_y, weights = make_targets(keypoints_tensor, device)
 
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y, _aux = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
+            pred_x, pred_y, _ = forward_model(model, pixels_tensor, role_tensor, spatial_tensor)
             sample_losses = per_sample_simcc_loss(pred_x, pred_y, target_x, target_y, weights)
             coords, joint_conf = decode_simcc(pred_x, pred_y, SIMCC_SPLIT_RATIO)
 
@@ -2268,6 +2279,8 @@ def _run_training(args, config, run_dir, run_config_path):
 
     checkpoint_metric = str(getattr(training_cfg, 'checkpoint_metric', 'val_loss')).lower()
     best_val_loss = float('inf')
+    epoch = 0
+    val_loss = float('inf')
     best_val_ap = -1.0
     epochs_without_improvement = 0
     best_path = run_dir / 'best.pt'
@@ -2319,7 +2332,7 @@ def _run_training(args, config, run_dir, run_config_path):
             train_samples, n_coco_train = mix_dance_with_coco(
                 dance_train_only,
                 coco_pool,
-                coco_cfg.dance_fraction,
+                coco_cfg.dance_fraction if coco_cfg is not None else 0.0,
                 seed=training_cfg.seed + 17 + epoch,
             )
             train_dataset.samples = train_samples
