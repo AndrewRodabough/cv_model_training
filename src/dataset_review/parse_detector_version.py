@@ -152,6 +152,12 @@ def build_bbox_annotations(
                         or ''
                     ),
                 }
+                couple_id = (
+                    attribute_value(shape, 'couple_id')
+                    or track_attribute_value(track, 'couple_id')
+                )
+                if couple_id is not None:
+                    person_attrs['couple_id'] = couple_id
                 role = (
                     attribute_value(shape, 'role')
                     or track_attribute_value(track, 'role')
@@ -241,7 +247,7 @@ def main():
         'changes': changes,
         'statistics': {
             'frames_used': image_count,
-            'tasks_used': 'x',
+            'tasks_used': len({task_id for task_id, _, _ in selected_images}),
             'tracks': track_count,
             'track_frames': track_frame_count,
         },

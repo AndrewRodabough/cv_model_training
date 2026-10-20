@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
     cv2 = None
 
 from src.dataset_review.export_bbox_detection import bbox_iou, union_bbox
+from src.training.detector_dataset import load_detector_samples
 
 
 def load_coco(path: Path) -> dict:
@@ -141,8 +142,9 @@ def draw_overlay(image_path: Path, gt_boxes, pred_boxes, out_path: Path, title: 
 
 def evaluate(
     *,
-    data_yaml: Path,
+    data_yaml: Path | None,
     weights: Path,
+    annotations_file: Path | None,
     cleaned_xml: Path | None,
     conf: float,
     iou: float,
@@ -152,17 +154,39 @@ def evaluate(
     out_dir: Path,
     device: str | None,
 ) -> dict:
-    with data_yaml.open(encoding='utf-8') as handle:
-        data_cfg = yaml.safe_load(handle)
-    root = Path(data_cfg['path'])
-    coco_path = root / 'annotations' / 'instances_val.json'
-    coco = load_coco(coco_path)
-    images = load_images(coco)
-    gt_by_image = load_gt_by_image(coco)
-
-    image_dir = root / 'images' / 'val'
-    image_paths = [image_dir / img['file_name'] for img in coco['images']]
-    image_paths = [p for p in image_paths if p.is_file()]
+    image_by_name: dict[str, Path] = {}
+    image_dir: Path | None = None
+    if annotations_file is not None:
+        samples = load_detector_samples(annotations_file)
+        images = {
+            index: {
+                'file_name': sample.image_path.name,
+                'task_id': sample.task_id,
+                'frame': sample.frame_number,
+            }
+            for index, sample in enumerate(samples)
+        }
+        gt_by_image = {
+            index: list(sample.boxes)
+            for index, sample in enumerate(samples)
+        }
+        image_by_name = {
+            sample.image_path.name: sample.image_path for sample in samples
+        }
+        image_paths = list(image_by_name.values())
+    else:
+        if data_yaml is None:
+            raise ValueError('Either data_yaml or annotations_file is required')
+        with data_yaml.open(encoding='utf-8') as handle:
+            data_cfg = yaml.safe_load(handle)
+        root = Path(data_cfg['path'])
+        coco_path = root / 'annotations' / 'instances_val.json'
+        coco = load_coco(coco_path)
+        images = load_images(coco)
+        gt_by_image = load_gt_by_image(coco)
+        image_dir = root / 'images' / 'val'
+        image_paths = [image_dir / img['file_name'] for img in coco['images']]
+        image_paths = [p for p in image_paths if p.is_file()]
     preds_by_name = run_predictions(weights, image_paths, conf=conf, iou=iou, device=device)
 
     keypoints = {}
@@ -243,24 +267,25 @@ def evaluate(
 
     # Ultralytics val metrics (optional, uses data.yaml)
     ultra_metrics = {}
-    try:
-        from ultralytics import YOLO
+    if data_yaml is not None:
+        try:
+            from ultralytics import YOLO
 
-        model = YOLO(str(weights))
-        val_kwargs = {'data': str(data_yaml.resolve()), 'split': 'val', 'verbose': False}
-        if device is not None:
-            val_kwargs['device'] = device
-        metrics = model.val(**val_kwargs)
-        box = getattr(metrics, 'box', None)
-        if box is not None:
-            ultra_metrics = {
-                'precision': float(getattr(box, 'mp', float('nan'))),
-                'recall': float(getattr(box, 'mr', float('nan'))),
-                'mAP50': float(getattr(box, 'map50', float('nan'))),
-                'mAP50_95': float(getattr(box, 'map', float('nan'))),
-            }
-    except Exception as exc:  # noqa: BLE001 - keep custom metrics even if val fails
-        ultra_metrics = {'error': str(exc)}
+            model = YOLO(str(weights))
+            val_kwargs = {'data': str(data_yaml.resolve()), 'split': 'val', 'verbose': False}
+            if device is not None:
+                val_kwargs['device'] = device
+            metrics = model.val(**val_kwargs)
+            box = getattr(metrics, 'box', None)
+            if box is not None:
+                ultra_metrics = {
+                    'precision': float(getattr(box, 'mp', float('nan'))),
+                    'recall': float(getattr(box, 'mr', float('nan'))),
+                    'mAP50': float(getattr(box, 'map50', float('nan'))),
+                    'mAP50_95': float(getattr(box, 'map', float('nan'))),
+                }
+        except Exception as exc:  # noqa: BLE001 - keep custom metrics if val fails
+            ultra_metrics = {'error': str(exc)}
 
     limb_coverage = (limb_covered / limb_total) if limb_total else None
     summary = {
@@ -284,7 +309,11 @@ def evaluate(
     worst = sorted(per_image_scores, key=lambda row: row['score'])[: max(0, overlays)]
     overlay_dir = out_dir / 'overlays'
     for rank, row in enumerate(worst, start=1):
-        image_path = image_dir / row['file_name']
+        image_path = image_by_name.get(row['file_name'])
+        if image_path is None:
+            if image_dir is None:
+                raise RuntimeError(f'No image path available for {row["file_name"]}')
+            image_path = image_dir / row['file_name']
         title = (
             f"#{rank} recall={row['recall_at_iou']:.2f} "
             f"limb={row['limb_coverage'] if row['limb_coverage'] is not None else 'n/a'}"
@@ -303,11 +332,17 @@ def evaluate(
 def main():
     parser = argparse.ArgumentParser(description='Evaluate dance bbox detector.')
     parser.add_argument('--weights', type=Path, required=True, help='Path to best.pt')
+    parser.add_argument('--data', type=Path, default=None, help='Legacy Ultralytics data.yaml')
     parser.add_argument(
-        '--data',
+        '--annotations',
         type=Path,
-        default=Path('dataset/detection/1.7.0/union_iou0.3/data.yaml'),
-        help='Ultralytics data.yaml from export_bbox_detection.py',
+        default=None,
+        help='Detector cleaned_annotations.xml (preferred model-agnostic input)',
+    )
+    parser.add_argument(
+        '--annotation-version',
+        default=None,
+        help='Detector version used to resolve cleaned_annotations.xml',
     )
     parser.add_argument(
         '--cleaned-xml',
@@ -339,8 +374,14 @@ def main():
     parser.add_argument('--device', default=None)
     args = parser.parse_args()
 
+    annotations_file = args.annotations
+    if annotations_file is None and args.annotation_version:
+        from src.util.get_version import get_detector_annotation_file
+
+        annotations_file = get_detector_annotation_file(args.annotation_version)
+
     cleaned_xml = args.cleaned_xml
-    if cleaned_xml is None:
+    if cleaned_xml is None and args.data is not None:
         # Detector evaluation uses the corresponding pose version's cleaned annotations.
         parts = Path(args.data).resolve().parts
         version = None
@@ -351,14 +392,18 @@ def main():
         if version:
             from src.util.get_version import get_pose_estimator_version_folder
 
-            candidate = get_pose_estimator_version_folder(version) / 'cleaned_annotations.xml'
-            if candidate.is_file():
-                cleaned_xml = candidate
+            from src.util.get_version import get_detector_annotation_file
+
+            try:
+                cleaned_xml = get_detector_annotation_file(version)
+            except FileNotFoundError:
+                cleaned_xml = None
 
     out_dir = args.out_dir or (args.weights.parent.parent / 'eval')
     summary = evaluate(
         data_yaml=args.data,
         weights=args.weights,
+        annotations_file=annotations_file,
         cleaned_xml=cleaned_xml,
         conf=args.conf,
         iou=args.iou,

@@ -28,6 +28,13 @@ def get_detector_version_folder(annotation_version: str) -> Path:
     return get_version_folder(DETECTOR_VERSION_DIR, annotation_version)
 
 
+def get_detector_annotation_file(annotation_version: str) -> Path:
+    annotation_file = get_detector_version_folder(annotation_version) / 'cleaned_annotations.xml'
+    if not annotation_file.is_file():
+        raise FileNotFoundError(f'Detector annotations not found: {annotation_file}')
+    return annotation_file
+
+
 def parse_version(version: str) -> tuple[int, int, int]:
     parts = version.split('.')
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
