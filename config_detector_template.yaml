@@ -1,0 +1,23 @@
+# Copy to config_detector.yaml and fill in values. config_detector.yaml is gitignored.
+dataset:
+  annotation_version: 1.7.0
+  data_yaml: dataset/detection/1.7.0/separate/data.yaml
+  union_iou_threshold: 0.3
+  always_separate: true
+  train_ratio: 0.8
+  min_track_length: 10
+
+model:
+  name: yolo11m.pt
+  imgsz: 640
+
+training:
+  seed: 44
+  epochs: 80
+  batch_size: 16
+  workers: 8
+  patience: 20
+  iou: 0.7
+  conf: 0.25
+  project: training/detector_runs
+  run_name: bbox_separate
