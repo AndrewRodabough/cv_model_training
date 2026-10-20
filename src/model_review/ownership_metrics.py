@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from metrics import compute_oks, decode_simcc, person_scale_in_crop
+from src.model_review.metrics import compute_oks, decode_simcc, person_scale_in_crop
 
 
 IOU_BUCKETS = (
@@ -47,7 +47,7 @@ def pick_partner(
     others: list[tuple[np.ndarray, tuple[float, float, float, float], str | None]],
 ) -> PartnerContext | None:
     """Choose the other person on the frame with highest bbox IoU."""
-    from train import bbox_iou
+    from src.training.train import bbox_iou
 
     best = None
     best_iou = -1.0

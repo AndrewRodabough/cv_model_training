@@ -13,9 +13,9 @@ import torch
 import yaml
 from PIL import Image
 
-import train as t
-from metrics import compute_oks, decode_simcc, person_scale_in_crop
-from ownership_metrics import (
+import src.training.train as t
+from src.model_review.metrics import compute_oks, decode_simcc, person_scale_in_crop
+from src.model_review.ownership_metrics import (
     format_ownership_summary,
     iou_bucket,
     joint_xy_mix_fraction,

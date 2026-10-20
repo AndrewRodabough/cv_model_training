@@ -12,9 +12,9 @@ import torch
 import yaml
 from PIL import Image
 
-import compare_vitpose_ap as cmp
-import train as train_mod
-from metrics import compute_oks, decode_simcc, person_scale_in_crop
+import src.model_review.compare_vitpose_ap as cmp
+import src.training.train as train_mod
+from src.model_review.metrics import compute_oks, decode_simcc, person_scale_in_crop
 
 ANKLES = ('ankle_l', 'ankle_r')
 TOES = ('toe_b_l', 'toe_s_l', 'toe_b_r', 'toe_s_r')

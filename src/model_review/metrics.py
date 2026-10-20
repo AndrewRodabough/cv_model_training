@@ -491,7 +491,7 @@ def evaluate_run_folder(
     """Evaluate OKS-AP for checkpoints in an existing training run folder."""
     import yaml
 
-    import train as train_mod
+    import src.training.train as train_mod
 
     run_dir = Path(run_dir)
     config_path = run_dir / 'config.yaml'

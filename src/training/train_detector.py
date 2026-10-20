@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from export_bbox_detection import export_detection_dataset
+from src.dataset_review.export_bbox_detection import export_detection_dataset
 
 
 def load_config(path: Path) -> dict:

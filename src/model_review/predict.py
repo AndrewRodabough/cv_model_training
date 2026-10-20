@@ -6,7 +6,15 @@ from PIL import Image, ImageDraw
 import torch
 
 from src.training.dino_cc import DinoCC
-from src.training.train import IMAGE_MEAN, IMAGE_SIZE, IMAGE_STD, KEYPOINT_IDS, BBOX_PADDING, encode_role
+from src.training.train import (
+    IMAGE_MEAN,
+    IMAGE_SIZE,
+    IMAGE_STD,
+    KEYPOINT_IDS,
+    BBOX_PADDING,
+    crop_normalized_bbox_center,
+    encode_role,
+)
 from src.util.vec import IVec2
 
 
@@ -80,7 +88,15 @@ def prepare_image(image, crop_info):
     return pixels.unsqueeze(0), crop_info
 
 
-def draw_prediction(image, coordinates, crop_info, output_path, person_joints=None):
+def draw_prediction(
+    image,
+    coordinates,
+    crop_info,
+    output_path,
+    person_joints=None,
+    keypoint_ids=None,
+):
+    keypoint_ids = KEYPOINT_IDS if keypoint_ids is None else keypoint_ids
     crop_x1, crop_y1, crop_width, crop_height = crop_info
     draw = ImageDraw.Draw(image)
     if crop_width != image.width or crop_height != image.height:
@@ -106,7 +122,7 @@ def draw_prediction(image, coordinates, crop_info, output_path, person_joints=No
             original_y = crop_y1 + y * crop_height / IMAGE_SIZE.y
             points.append((original_x, original_y))
 
-        point_by_id = dict(zip(KEYPOINT_IDS, points))
+        point_by_id = dict(zip(keypoint_ids, points))
         for first_id, second_id in SKELETON_CONNECTIONS:
             first = point_by_id.get(first_id)
             second = point_by_id.get(second_id)
@@ -122,7 +138,7 @@ def draw_prediction(image, coordinates, crop_info, output_path, person_joints=No
             )
             draw.text(
                 (x + 4, y - 4),
-                str(KEYPOINT_IDS[index]),
+                str(keypoint_ids[index]),
                 fill='white',
                 stroke_width=1,
                 stroke_fill='black',
@@ -154,16 +170,17 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(args.weights, map_location=device)
-    checkpoint_keypoint_ids = checkpoint.get('keypoint_ids', KEYPOINT_IDS)
-    if list(checkpoint_keypoint_ids) != KEYPOINT_IDS:
-        raise ValueError(
-            f'Checkpoint keypoints {checkpoint_keypoint_ids} do not match this inference script {KEYPOINT_IDS}.'
-        )
+    checkpoint_keypoint_ids = list(checkpoint.get('keypoint_ids', KEYPOINT_IDS))
 
     couple_mode = bool(checkpoint.get('couple_mode', False)) or (
         checkpoint.get('head_name') == 'couple_joint_query_self_attn_simcc'
     )
-    person_joints = int(checkpoint.get('person_joints', len(KEYPOINT_IDS)))
+    person_joints = int(checkpoint.get('person_joints', len(checkpoint_keypoint_ids)))
+    if len(checkpoint_keypoint_ids) != person_joints:
+        raise ValueError(
+            f'Checkpoint keypoint metadata has {len(checkpoint_keypoint_ids)} IDs '
+            f'but person_joints={person_joints}.'
+        )
     num_joints = int(checkpoint.get('num_joints', 2 * person_joints if couple_mode else person_joints))
 
     model = DinoCC(
@@ -201,7 +218,10 @@ def main():
     use_spatial = bool(head_kwargs.get('use_spatial_prompt', False))
     spatial = None
     if use_spatial:
-        from train import crop_normalized_bbox_center
+        if bbox is None:
+            raise ValueError(
+                'This checkpoint uses spatial prompting; --bbox is required.'
+            )
 
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
@@ -225,6 +245,7 @@ def main():
         crop_info,
         args.output,
         person_joints=person_joints if couple_mode else None,
+        keypoint_ids=checkpoint_keypoint_ids,
     )
     print(f'Saved overlay to {args.output}')
 

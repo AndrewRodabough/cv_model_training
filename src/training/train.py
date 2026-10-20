@@ -1,5 +1,4 @@
-import argparse
-import csv
+from argparse import ArgumentParser
 import gc
 import random
 import shutil
@@ -9,9 +8,7 @@ from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Any
-
 import numpy as np
-from dataclasses import dataclass
 import yaml
 from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 import torch
@@ -26,8 +23,12 @@ from src.config.simcc_config import SimCCConfig
 from src.config.joint_query_simcc_config import JointQuerySimCCConfig
 from src.config.couple_joint_query_simcc_config import CoupleJointQuerySimCCConfig
 from src.config.training_config import TrainingConfig
-from src.util.stdout_csv_tee import StdoutCsvTee
 from src.config.dataset_config import DatasetConfig
+from src.config.keypoint_mapping_config import keypoint_mapping
+from src.util.stdout_csv_tee import StdoutCsvTee
+from src.util.vec import IVec2
+from src.util.dir import POSE_ESTIMATOR_RUN_DIR, DEFAULT_POSE_ESTIMATOR_CONFIG_PATH
+from src.util.get_version import get_pose_estimator_version_folder
 
 from src.model_review.metrics import (
     align_keypoints_to_num_joints,
@@ -47,21 +48,6 @@ from src.training.coco_wholebody_dataset import (
     mix_dance_with_coco,
     target_coco_count,
 )
-
-from src.util.vec import IVec2
-
-
-
-
-
-@dataclass
-class keypoint_mapping:
-    name: str
-    num_keypoints: int
-    keypoints: dict
-    left_right_pairs: list | None = None
-    oks_sigmas: dict[str, float] | None = None
-
 
 IMAGE_SIZE = IVec2(384, 512)
 KEYPOINT_IDS = list(range(6, 12)) + list(range(15, 29))
@@ -1369,48 +1355,10 @@ def load_keypoint_format(format_name) -> keypoint_mapping:
         return keypoint_mapping(**yaml.safe_load(f))
 
 def get_annotation_file_path(annotation_version: str) -> Path:
-    # Parse version parts (e.g., '1.2.0' -> major='1', minor='2', patch='0')
-    parts = annotation_version.split(".")
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        raise ValueError(
-            f"Expected semantic version format 'X.Y.Z', got: {annotation_version}"
-        )
-
-    major, minor, _ = parts
-    major_dir = f"{major}.X"
-    minor_dir = f"{major}.{minor}.X"
-
-    dataset_dir = Path("dataset") / "versions" / major_dir / minor_dir / annotation_version
-    annotation_file = dataset_dir / "cleaned_annotations.xml"
-    raw_annotations = dataset_dir / "annotations.xml"
-
-    if annotation_file.is_file():
-        return annotation_file
-
-    if not dataset_dir.is_dir():
-        raise FileNotFoundError(f"Dataset version directory not found: {dataset_dir}")
-    if not raw_annotations.is_file():
-        raise FileNotFoundError(
-            f"cleaned_annotations.xml missing and no annotations.xml to build from: {raw_annotations}"
-        )
-
-    print(
-        f"cleaned_annotations.xml not found for {annotation_version}; "
-        f"running dataset_parser.py {annotation_version} ..."
-    )
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "dataset_parser.py"), annotation_version],
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"dataset_parser.py failed with exit code {result.returncode} "
-            f"while building {annotation_file}"
-        )
+    version_dir = get_pose_estimator_version_folder(annotation_version)
+    annotation_file = version_dir / 'cleaned_annotations.xml'
     if not annotation_file.is_file():
-        raise FileNotFoundError(
-            f"dataset_parser.py finished but cleaned annotations still missing: {annotation_file}"
-        )
+        raise FileNotFoundError(f'Cleaned annotations not found: {annotation_file}')
     return annotation_file
 
 
@@ -2155,34 +2103,6 @@ def export_checkpoint_metrics(
     return metrics
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
-    parser.add_argument('--config', default='config.yaml')
-    parser.add_argument('--workers', type=int, default=6)
-    parser.add_argument(
-        '--init-checkpoint',
-        default=None,
-        help='Load model weights from this .pt (fresh optimizer; for continued training).',
-    )
-    args = parser.parse_args()
-
-    config_path = Path(args.config).resolve()
-    with open(config_path, encoding='utf-8') as config_file:
-        raw_config = yaml.safe_load(config_file)
-    config = parse_config(raw_config)
-
-    runs_dir = Path('training/runs')
-    run_dir, run_config_path = create_run_dir(runs_dir, config_path)
-
-    log_tee = StdoutCsvTee(sys.stdout, run_dir / 'log.csv')
-    sys.stdout = log_tee
-    try:
-        _run_training(args, config, run_dir, run_config_path)
-    finally:
-        sys.stdout = log_tee.stream
-        log_tee.close()
-
-
 def _run_training(args, config, run_dir, run_config_path):
     dataset_cfg: DatasetConfig = config['dataset']
     training_cfg: TrainingConfig = config['training']
@@ -2547,6 +2467,32 @@ def _run_training(args, config, run_dir, run_config_path):
                 batch_size=training_cfg.batch_size,
                 annotation_version=dataset_cfg.annotation_version,
             )
+
+
+def main():
+    parser = ArgumentParser(description='Train DinoCC on the cleaned keypoint dataset.')
+    parser.add_argument('--config', default=DEFAULT_POSE_ESTIMATOR_CONFIG_PATH)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument(
+        '--init-checkpoint',
+        default=None,
+        help='Load model weights from this .pt (fresh optimizer; for continued training).',
+    )
+    args = parser.parse_args()
+
+    with open(args.config, encoding='utf-8') as config_file:
+        raw_config = yaml.safe_load(config_file)
+    config = parse_config(raw_config)
+
+    run_dir, run_config_path = create_run_dir(POSE_ESTIMATOR_RUN_DIR, args.config)
+
+    log_tee = StdoutCsvTee(sys.stdout, run_dir / 'log.csv')
+    sys.stdout = log_tee
+    try:
+        _run_training(args, config, run_dir, run_config_path)
+    finally:
+        sys.stdout = log_tee.stream
+        log_tee.close()
 
 
 if __name__ == '__main__':

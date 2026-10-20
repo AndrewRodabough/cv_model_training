@@ -32,8 +32,8 @@ import torch
 import yaml
 from PIL import Image
 
-import train as train_mod
-from metrics import (
+import src.training.train as train_mod
+from src.model_review.metrics import (
     compute_oks,
     decode_simcc,
     format_metrics_summary,

@@ -18,15 +18,15 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
-from dataset_parser import (
+from src.dataset_review.dataset_parser import (
     IMAGES_DIR,
     attribute_is_true,
     attribute_value,
     load_project,
-    resolve_dataset_dir,
     shape_should_include,
     track_attribute_value,
 )
+from src.util.get_version import get_pose_estimator_version_folder
 
 PERSON_CATEGORY_ID = 1
 PERSON_CATEGORY = {'id': PERSON_CATEGORY_ID, 'name': 'person', 'supercategory': 'person'}
@@ -138,7 +138,7 @@ def collect_cleaned_person_boxes(
         if track.get('label') != 'bbox':
             continue
         task_id = track.get('task_id')
-        if task_id not in tasks:
+        if task_id is None or task_id not in tasks:
             continue
         track_id = track.get('id', '')
         if track_lengths[track_id] < min_track_length:
@@ -391,10 +391,18 @@ def export_detection_dataset(
     frame_stride: int | None,
     soft_band: float = 0.0,
 ) -> Path:
-    dataset_dir = resolve_dataset_dir(annotation_version)
-    annotations_file = dataset_dir / 'annotations.xml'
-    if not annotations_file.is_file():
-        raise FileNotFoundError(f'Missing annotations XML: {annotations_file}')
+    dataset_dir = get_pose_estimator_version_folder(annotation_version)
+    annotation_candidates = (
+        dataset_dir / 'cleaned_annotations.xml',
+        dataset_dir / 'annotations.xml',
+    )
+    annotations_file = next(
+        (candidate for candidate in annotation_candidates if candidate.is_file()),
+        None,
+    )
+    if annotations_file is None:
+        expected = ', '.join(str(path) for path in annotation_candidates)
+        raise FileNotFoundError(f'Missing annotations XML; checked: {expected}')
 
     frames, task_names, collect_stats = collect_cleaned_person_boxes(
         annotations_file,

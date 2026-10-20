@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     cv2 = None
 
-from export_bbox_detection import bbox_iou, union_bbox
+from src.dataset_review.export_bbox_detection import bbox_iou, union_bbox
 
 
 def load_coco(path: Path) -> dict:
@@ -341,7 +341,7 @@ def main():
 
     cleaned_xml = args.cleaned_xml
     if cleaned_xml is None:
-        # Heuristic: dataset/detection/<ver>/... -> dataset/versions/.../cleaned_annotations.xml
+        # Detector evaluation uses the corresponding pose version's cleaned annotations.
         parts = Path(args.data).resolve().parts
         version = None
         if 'detection' in parts:
@@ -349,9 +349,9 @@ def main():
             if idx + 1 < len(parts):
                 version = parts[idx + 1]
         if version:
-            from dataset_parser import resolve_dataset_dir
+            from src.util.get_version import get_pose_estimator_version_folder
 
-            candidate = resolve_dataset_dir(version) / 'cleaned_annotations.xml'
+            candidate = get_pose_estimator_version_folder(version) / 'cleaned_annotations.xml'
             if candidate.is_file():
                 cleaned_xml = candidate
 

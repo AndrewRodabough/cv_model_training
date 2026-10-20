@@ -189,6 +189,12 @@ def main():
         default=True,
         help='Collect a description and change log interactively',
     )
+    parser.add_argument(
+        '--non-interactive',
+        dest='interactive',
+        action='store_false',
+        help='Skip description and change prompts',
+    )
     args = parser.parse_args()
 
     if not exists(args.input_file):

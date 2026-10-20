@@ -50,7 +50,18 @@ def main():
     parser.add_argument('--input-file', type=str, help='The input file')
     parser.add_argument('--version-type', choices=('major', 'minor', 'patch'),type=str, required=True)
     parser.add_argument('--keypoints-used', type=str, required=True, help='comma separated list of keypoints used e.e. 1, 2. 3 or name of mapping i.e. "dance_23"')
-    parser.add_argument('--interactive', type=bool, default=True, help='if true, will ask for input for description and changes')
+    parser.add_argument(
+        '--interactive',
+        action='store_true',
+        default=True,
+        help='Collect a description and change log interactively',
+    )
+    parser.add_argument(
+        '--non-interactive',
+        dest='interactive',
+        action='store_false',
+        help='Skip description and change prompts',
+    )
     args = parser.parse_args()
 
     # check if input file exists
@@ -65,16 +76,16 @@ def main():
         # convert keypoints to the CVAT mapping
         keypoints_used = convert_keypoint_ids(args.keypoints_used, CVAT_DEFAULT_MAPPING_NAME)
 
-    # if interactive, ask for description and change log
+    description = ''
+    changes = []
     if args.interactive:
         description = input('Enter Description: ')
 
-        change = None
-        changes = []
-        while change != '':
+        while True:
             change = input('Enter Change (enter for done): ')
-            if change:
-                changes.append(change)
+            if not change:
+                break
+            changes.append(change)
 
     # parse the file and save it at the version folder
     latest_version = get_latest_pose_estimator_version()
