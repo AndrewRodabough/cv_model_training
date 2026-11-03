@@ -26,4 +26,4 @@ deploy/nuclio/__pycache__/
 # Keep only dataset version manifests; ignore images/XML/etc.
 /dataset/**
 !/dataset/**/
-!/dataset/**/manifest.yaml
+!/dataset/**/manifest.yamlweight_space_data/
