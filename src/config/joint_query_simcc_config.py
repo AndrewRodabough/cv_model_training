@@ -35,3 +35,16 @@ class JointQuerySimCCConfig:
     use_local_cross_attn: bool = False
     local_attn_sigma: float = 2.0
     local_attn_strength: float = 2.0
+    # Where to center the Gaussian in train when GT is passed:
+    #   pred — soft-decoded previous layer (also used at val/infer)
+    #   gt   — labeled joint XY (soft prior; invisible joints get no bias)
+    #   mix  — gt_mix * gt + (1 - gt_mix) * pred (pred-only if no GT)
+    local_attn_center_mode: str = 'pred'
+    local_attn_gt_mix: float = 0.7
+    # Temporal joint-query head (ignored by non-temporal heads)
+    temporal_num_layers: int = 2
+    temporal_num_heads: int = 8
+    temporal_dropout: float = 0.0
+    window_size: int = 5
+    # peer_self_attn | center_cross_attn
+    temporal_mode: str = 'peer_self_attn'

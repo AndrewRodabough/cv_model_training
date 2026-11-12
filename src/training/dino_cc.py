@@ -327,15 +327,23 @@ class _JointQueryDecoderLayer(nn.Module):
       cond: torch.Tensor | None = None,
       self_attn_bias: torch.Tensor | None = None,
       cross_attn_bias: torch.Tensor | None = None,
-  ) -> torch.Tensor:
+      return_cross_attn: bool = False,
+  ):
     q_base = self.norm_q(queries)
     q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    attn_out, _ = self.cross_attn(
-        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    attn_out, cross_w = self.cross_attn(
+        q,
+        kv,
+        kv,
+        attn_mask=cross_attn_bias,
+        need_weights=return_cross_attn,
+        average_attn_weights=True,
     )
     queries = queries + attn_out
     queries = queries + self.ffn(self.norm_ffn(queries))
+    if return_cross_attn:
+      return queries, cross_w
     return queries
 
 
@@ -375,7 +383,8 @@ class _JointQuerySelfAttnDecoderLayer(nn.Module):
       cond: torch.Tensor | None = None,
       self_attn_bias: torch.Tensor | None = None,
       cross_attn_bias: torch.Tensor | None = None,
-  ) -> torch.Tensor:
+      return_cross_attn: bool = False,
+  ):
     q_content = self.norm_self(queries)
     if cond is not None:
       q_self = q_content + cond
@@ -396,11 +405,18 @@ class _JointQuerySelfAttnDecoderLayer(nn.Module):
     q_base = self.norm_q(queries)
     q = q_base + cond if cond is not None else q_base
     kv = self.norm_kv(memory)
-    cross_out, _ = self.cross_attn(
-        q, kv, kv, attn_mask=cross_attn_bias, need_weights=False
+    cross_out, cross_w = self.cross_attn(
+        q,
+        kv,
+        kv,
+        attn_mask=cross_attn_bias,
+        need_weights=return_cross_attn,
+        average_attn_weights=True,
     )
     queries = queries + cross_out
     queries = queries + self.ffn(self.norm_ffn(queries))
+    if return_cross_attn:
+      return queries, cross_w
     return queries
 
 
@@ -479,9 +495,13 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       pair_bias_bones: list[tuple[int, int]] | None = None,
       pair_bias_lr_pairs: list[tuple[int, int]] | None = None,
       pair_bias_init: float = 2.0,
+      # Optional per shared-type init (len == num types). Noise init only; ckpt overwrites.
+      pair_bias_type_inits: list[float] | None = None,
       use_local_cross_attn: bool = False,
       local_attn_sigma: float = 2.0,
       local_attn_strength: float = 2.0,
+      local_attn_center_mode: str = 'pred',
+      local_attn_gt_mix: float = 0.7,
       **kwargs,
   ):
     super().__init__()
@@ -493,6 +513,13 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       )
     if use_local_cross_attn and local_attn_sigma <= 0:
       raise ValueError(f'local_attn_sigma must be > 0, got {local_attn_sigma}')
+    center_mode = str(local_attn_center_mode).lower().strip()
+    if center_mode not in ('pred', 'gt', 'mix'):
+      raise ValueError(
+          f"local_attn_center_mode must be 'pred', 'gt', or 'mix'; got {local_attn_center_mode!r}"
+      )
+    if not 0.0 <= float(local_attn_gt_mix) <= 1.0:
+      raise ValueError(f'local_attn_gt_mix must be in [0, 1], got {local_attn_gt_mix}')
 
     self.grid_size = grid_size
     self.neck_dim = neck_dim
@@ -509,6 +536,8 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     self.use_local_cross_attn = use_local_cross_attn
     self.local_attn_sigma = float(local_attn_sigma)
     self.local_attn_strength = float(local_attn_strength)
+    self.local_attn_center_mode = center_mode
+    self.local_attn_gt_mix = float(local_attn_gt_mix)
     self.split_ratio = float(split_ratio)
     self.out_size = out_size
     self.out_bins_size = IVec2(
@@ -563,9 +592,20 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
       if num_types <= 0:
         raise ValueError('use_pair_bias=True produced zero shared edge types')
       self.register_buffer('pair_bias_index', bias_index, persistent=True)
-      self.pair_bias_values = nn.Parameter(
-          torch.full((num_types,), float(pair_bias_init), dtype=torch.float32)
-      )
+      if pair_bias_type_inits is not None:
+        if len(pair_bias_type_inits) != num_types:
+          raise ValueError(
+              f'pair_bias_type_inits length {len(pair_bias_type_inits)} != '
+              f'num shared edge types {num_types}'
+          )
+        init_values = torch.tensor(
+            [float(v) for v in pair_bias_type_inits], dtype=torch.float32
+        )
+      else:
+        init_values = torch.full(
+            (num_types,), float(pair_bias_init), dtype=torch.float32
+        )
+      self.pair_bias_values = nn.Parameter(init_values)
     else:
       self.pair_bias_index = None
       self.pair_bias_values = None
@@ -662,12 +702,19 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     return torch.stack((x, y), dim=-1).clamp(0.0, 1.0)
 
   def _gaussian_cross_attn_bias(
-      self, normed_xy: torch.Tensor, batch_size: int, dtype, device
+      self,
+      normed_xy: torch.Tensor,
+      batch_size: int,
+      dtype,
+      device,
+      joint_valid: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Additive cross-attn bias [B*heads, K, N] peaked at each joint's patch.
 
     ``normed_xy`` is crop-normalized [B, K, 2] (x, y) in [0, 1]. Distances are
     in patch-grid units; ``local_attn_sigma`` is the Gaussian width in patches.
+    ``joint_valid`` optional [B, K] bool/float — zero bias for invalid joints
+    (keeps global attn for unlabeled / occluded).
     """
     gw = self.grid_size.x
     gh = self.grid_size.y
@@ -681,6 +728,8 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     dist_sq = (diff * scale).pow(2).sum(dim=-1)  # [B, K, N]
     sigma = self.local_attn_sigma
     bias = self.local_attn_strength * torch.exp(-dist_sq / (2.0 * sigma * sigma))
+    if joint_valid is not None:
+      bias = bias * joint_valid.to(device=device, dtype=dtype).unsqueeze(-1)
     # MHA float attn_mask expects [B * num_heads, tgt_len, src_len]
     return (
         bias.unsqueeze(1)
@@ -688,17 +737,52 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
         .reshape(batch_size * self.num_heads, self.num_joints, -1)
     )
 
-  def forward(
+  def _local_cross_attn_center(
+      self,
+      pred_normed: torch.Tensor | None,
+      gt_normed: torch.Tensor | None,
+  ) -> torch.Tensor | None:
+    """Pick Gaussian center for local cross-attn (soft prior, not a hard mask)."""
+    mode = self.local_attn_center_mode
+    if gt_normed is not None and mode in ('gt', 'mix'):
+      if mode == 'gt' or pred_normed is None:
+        return gt_normed
+      mix = self.local_attn_gt_mix
+      return mix * gt_normed + (1.0 - mix) * pred_normed
+    return pred_normed
+
+  def _decode_queries(
       self,
       patch_tokens: torch.Tensor,
       role: torch.Tensor | None = None,
       spatial: torch.Tensor | None = None,
+      return_cross_attn: bool = False,
+      joint_xy_normed: torch.Tensor | None = None,
+      joint_valid: torch.Tensor | None = None,
   ):
+    """Run joint-query decoder; return ``(queries, early_aux, last_cross_attn)``.
+
+    ``early_aux`` is a list of ``(pred_x, pred_y)`` from layers before the last
+    when ``deep_supervision`` is on (empty otherwise). ``last_cross_attn`` is set
+    only when ``return_cross_attn`` is True.
+    """
     B, N, _ = patch_tokens.shape
     expected_n = self.grid_size.x * self.grid_size.y
     if N != expected_n:
       raise ValueError(
           f'Expected {expected_n} patch tokens for grid {self.grid_size.x}x{self.grid_size.y}, got {N}'
+      )
+    if joint_xy_normed is not None:
+      if joint_xy_normed.shape[:2] != (B, self.num_joints):
+        raise ValueError(
+            f'joint_xy_normed expected shape [B={B}, K={self.num_joints}, 2], '
+            f'got {tuple(joint_xy_normed.shape)}'
+        )
+      joint_xy_normed = joint_xy_normed.clamp(0.0, 1.0)
+    if joint_valid is not None and joint_valid.shape[:2] != (B, self.num_joints):
+      raise ValueError(
+          f'joint_valid expected shape [B={B}, K={self.num_joints}], '
+          f'got {tuple(joint_valid.shape)}'
       )
 
     memory = self.input_proj(patch_tokens) + self.patch_pos_embed
@@ -715,29 +799,43 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
     need_layer_preds = (
         self.deep_supervision or self.use_joint_pos_embed or self.use_local_cross_attn
     )
-    for layer in self.layers:
-      normed = None
+    last_cross_attn = None
+    n_layers = len(self.layers)
+    for layer_i, layer in enumerate(self.layers):
+      pred_normed = None
       if prev_pred_x is not None and prev_pred_y is not None:
         # Detach so early layers get gradients from deep-sup, not through feedback.
-        normed = self._soft_decode_normed(prev_pred_x.detach(), prev_pred_y.detach())
+        pred_normed = self._soft_decode_normed(prev_pred_x.detach(), prev_pred_y.detach())
       if (
           self.use_joint_pos_embed
           and self.joint_pos_mlp is not None
-          and normed is not None
+          and pred_normed is not None
       ):
-        queries = queries + self.joint_pos_mlp(normed.to(dtype=queries.dtype))
+        queries = queries + self.joint_pos_mlp(pred_normed.to(dtype=queries.dtype))
       cross_attn_bias = None
-      if self.use_local_cross_attn and normed is not None:
-        cross_attn_bias = self._gaussian_cross_attn_bias(
-            normed, B, memory.dtype, memory.device
-        )
-      queries = layer(
+      if self.use_local_cross_attn:
+        center = self._local_cross_attn_center(pred_normed, joint_xy_normed)
+        if center is not None:
+          cross_attn_bias = self._gaussian_cross_attn_bias(
+              center,
+              B,
+              memory.dtype,
+              memory.device,
+              joint_valid=joint_valid,
+          )
+      want_w = return_cross_attn and layer_i == n_layers - 1
+      layer_out = layer(
           queries,
           memory,
           cond,
           self_attn_bias=self_attn_bias,
           cross_attn_bias=cross_attn_bias,
+          return_cross_attn=want_w,
       )
+      if want_w:
+        queries, last_cross_attn = layer_out
+      else:
+        queries = layer_out
       if need_layer_preds:
         pred_x_i = self.fc_x(queries)
         pred_y_i = self.fc_y(queries)
@@ -745,13 +843,39 @@ class _BaseJointQuerySimCCHead(BaseSimCCHead):
         if self.deep_supervision:
           aux_preds.append((pred_x_i, pred_y_i))
 
-    if self.deep_supervision:
-      pred_x, pred_y = aux_preds[-1]
+    if self.deep_supervision and aux_preds:
       early_aux = aux_preds[:-1] if len(aux_preds) > 1 else []
-      return pred_x, pred_y, early_aux
+    else:
+      early_aux = []
+    return queries, early_aux, last_cross_attn
 
+  def forward(
+      self,
+      patch_tokens: torch.Tensor,
+      role: torch.Tensor | None = None,
+      spatial: torch.Tensor | None = None,
+      return_cross_attn: bool = False,
+      joint_xy_normed: torch.Tensor | None = None,
+      joint_valid: torch.Tensor | None = None,
+      temporal_len: int | None = None,
+  ):
+    del temporal_len  # single-frame heads ignore window length
+    queries, early_aux, last_cross_attn = self._decode_queries(
+        patch_tokens,
+        role=role,
+        spatial=spatial,
+        return_cross_attn=return_cross_attn,
+        joint_xy_normed=joint_xy_normed,
+        joint_valid=joint_valid,
+    )
     pred_x = self.fc_x(queries)
     pred_y = self.fc_y(queries)
+    if self.deep_supervision:
+      if return_cross_attn:
+        return pred_x, pred_y, early_aux, last_cross_attn
+      return pred_x, pred_y, early_aux
+    if return_cross_attn:
+      return pred_x, pred_y, last_cross_attn
     return pred_x, pred_y
 
 
@@ -765,6 +889,224 @@ class JointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
   """Joint queries with self-attention among joints, then cross-attention to patches + SimCC."""
 
   _layer_cls = _JointQuerySelfAttnDecoderLayer
+
+
+class _TemporalJointQueryLayer(nn.Module):
+  """Self-attention over time for each joint independently (B*K, T, D)."""
+
+  def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+    super().__init__()
+    self.norm = nn.LayerNorm(dim)
+    self.attn = nn.MultiheadAttention(
+        embed_dim=dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        batch_first=True,
+    )
+    self.norm_ffn = nn.LayerNorm(dim)
+    self.ffn = nn.Sequential(
+        nn.Linear(dim, dim * 4),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim * 4, dim),
+        nn.Dropout(dropout),
+    )
+
+  def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    # tokens: [B*K, T, D]
+    h = self.norm(tokens)
+    out, _ = self.attn(h, h, h, need_weights=False)
+    tokens = tokens + out
+    tokens = tokens + self.ffn(self.norm_ffn(tokens))
+    return tokens
+
+
+class _TemporalCenterCrossAttnLayer(nn.Module):
+  """Center query cross-attends to full-window K/V per joint (B*K, 1, D) x (B*K, T, D)."""
+
+  def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+    super().__init__()
+    self.norm_q = nn.LayerNorm(dim)
+    self.norm_kv = nn.LayerNorm(dim)
+    self.attn = nn.MultiheadAttention(
+        embed_dim=dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        batch_first=True,
+    )
+    self.norm_ffn = nn.LayerNorm(dim)
+    self.ffn = nn.Sequential(
+        nn.Linear(dim, dim * 4),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim * 4, dim),
+        nn.Dropout(dropout),
+    )
+
+  def forward(self, center: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+    # center: [B*K, 1, D], history: [B*K, T, D]
+    q = self.norm_q(center)
+    kv = self.norm_kv(history)
+    out, _ = self.attn(q, kv, kv, need_weights=False)
+    center = center + out
+    center = center + self.ffn(self.norm_ffn(center))
+    return center
+
+
+class TemporalJointQuerySelfAttnSimCCHead(JointQuerySelfAttnSimCCHead):
+  """Per-frame joint-query decoder + temporal fusion over T, then SimCC.
+
+  ``temporal_mode``:
+    - ``peer_self_attn``: bidirectional self-attn over T (all frames rewritten).
+    - ``center_cross_attn``: only the center frame cross-attends to history;
+      side frames pass through unchanged.
+  """
+
+  def __init__(
+      self,
+      *args,
+      temporal_num_layers: int = 2,
+      temporal_num_heads: int = 8,
+      temporal_dropout: float = 0.0,
+      window_size: int = 5,
+      temporal_mode: str = 'peer_self_attn',
+      **kwargs,
+  ):
+    super().__init__(*args, **kwargs)
+    if temporal_num_layers < 1:
+      raise ValueError(f'temporal_num_layers must be >= 1, got {temporal_num_layers}')
+    if self.neck_dim % temporal_num_heads != 0:
+      raise ValueError(
+          f'neck_dim ({self.neck_dim}) must be divisible by '
+          f'temporal_num_heads ({temporal_num_heads})'
+      )
+    if window_size < 1:
+      raise ValueError(f'window_size must be >= 1, got {window_size}')
+    mode = str(temporal_mode).strip().lower()
+    if mode not in {'peer_self_attn', 'center_cross_attn'}:
+      raise ValueError(
+          f'temporal_mode must be peer_self_attn or center_cross_attn, got {temporal_mode!r}'
+      )
+    self.temporal_mode = mode
+    self.temporal_num_layers = int(temporal_num_layers)
+    self.window_size = int(window_size)
+    if self.temporal_mode == 'peer_self_attn':
+      self.time_embed = nn.Parameter(
+          torch.randn(1, self.window_size, 1, self.neck_dim) * 0.02
+      )
+      self.rel_time_embed = None
+      self.temporal_layers = nn.ModuleList(
+          [
+              _TemporalJointQueryLayer(
+                  self.neck_dim, temporal_num_heads, temporal_dropout
+              )
+              for _ in range(self.temporal_num_layers)
+          ]
+      )
+    else:
+      # Relative offsets in [-W+1, W-1] → table length 2W-1.
+      self.time_embed = None
+      self.rel_time_embed = nn.Parameter(
+          torch.randn(1, 2 * self.window_size - 1, self.neck_dim) * 0.02
+      )
+      self.temporal_layers = nn.ModuleList(
+          [
+              _TemporalCenterCrossAttnLayer(
+                  self.neck_dim, temporal_num_heads, temporal_dropout
+              )
+              for _ in range(self.temporal_num_layers)
+          ]
+      )
+
+  def _apply_temporal_peer(self, queries: torch.Tensor, temporal_len: int) -> torch.Tensor:
+    bt, k, d = queries.shape
+    batch = bt // temporal_len
+    q = queries.view(batch, temporal_len, k, d)
+    q = q + self.time_embed[:, :temporal_len].to(dtype=q.dtype)
+    q = q.permute(0, 2, 1, 3).contiguous().view(batch * k, temporal_len, d)
+    for layer in self.temporal_layers:
+      q = layer(q)
+    q = q.view(batch, k, temporal_len, d).permute(0, 2, 1, 3).contiguous()
+    return q.view(bt, k, d)
+
+  def _apply_temporal_center_cross(
+      self, queries: torch.Tensor, temporal_len: int
+  ) -> torch.Tensor:
+    bt, k, d = queries.shape
+    batch = bt // temporal_len
+    # [B, T, K, D]
+    q = queries.view(batch, temporal_len, k, d)
+    center_idx = temporal_len // 2
+    # Relative time embeds for K/V: offset t-c mapped into [0, 2W-2].
+    offsets = torch.arange(temporal_len, device=q.device) - center_idx
+    rel_idx = offsets + (self.window_size - 1)
+    if int(rel_idx.min()) < 0 or int(rel_idx.max()) >= self.rel_time_embed.shape[1]:
+      raise ValueError(
+          f'relative time index out of range for temporal_len={temporal_len}, '
+          f'window_size={self.window_size}'
+      )
+    rel = self.rel_time_embed[:, rel_idx].to(dtype=q.dtype)  # [1, T, D]
+    history = q + rel[:, :, None, :]  # [B, T, K, D]
+    # Per-joint: center Q [B*K, 1, D], history KV [B*K, T, D]
+    center = q[:, center_idx].contiguous().view(batch * k, 1, d)
+    # Add zero-offset embed to the query as well (offset 0 → index W-1).
+    center = center + self.rel_time_embed[:, self.window_size - 1].to(dtype=q.dtype).view(
+        1, 1, d
+    )
+    history_bk = history.permute(0, 2, 1, 3).contiguous().view(batch * k, temporal_len, d)
+    for layer in self.temporal_layers:
+      center = layer(center, history_bk)
+    refined = center.view(batch, k, d)
+    out = q.clone()
+    out[:, center_idx] = refined
+    return out.view(bt, k, d)
+
+  def _apply_temporal(self, queries: torch.Tensor, temporal_len: int) -> torch.Tensor:
+    """queries [B*T, K, D] → temporally fused [B*T, K, D]."""
+    bt, _k, _d = queries.shape
+    if bt % temporal_len != 0:
+      raise ValueError(
+          f'Batch*time {bt} is not divisible by temporal_len={temporal_len}'
+      )
+    if temporal_len > self.window_size:
+      raise ValueError(
+          f'temporal_len {temporal_len} exceeds configured window_size {self.window_size}'
+      )
+    if self.temporal_mode == 'center_cross_attn':
+      return self._apply_temporal_center_cross(queries, temporal_len)
+    return self._apply_temporal_peer(queries, temporal_len)
+
+  def forward(
+      self,
+      patch_tokens: torch.Tensor,
+      role: torch.Tensor | None = None,
+      spatial: torch.Tensor | None = None,
+      return_cross_attn: bool = False,
+      joint_xy_normed: torch.Tensor | None = None,
+      joint_valid: torch.Tensor | None = None,
+      temporal_len: int | None = None,
+  ):
+    queries, early_aux, last_cross_attn = self._decode_queries(
+        patch_tokens,
+        role=role,
+        spatial=spatial,
+        return_cross_attn=return_cross_attn,
+        joint_xy_normed=joint_xy_normed,
+        joint_valid=joint_valid,
+    )
+    t_len = 1 if temporal_len is None else int(temporal_len)
+    if t_len > 1:
+      queries = self._apply_temporal(queries, t_len)
+    pred_x = self.fc_x(queries)
+    pred_y = self.fc_y(queries)
+    if self.deep_supervision:
+      # Deep-sup aux is pre-temporal; still useful for stabilizing the encoder.
+      if return_cross_attn:
+        return pred_x, pred_y, early_aux, last_cross_attn
+      return pred_x, pred_y, early_aux
+    if return_cross_attn:
+      return pred_x, pred_y, last_cross_attn
+    return pred_x, pred_y
 
 
 class CoupleJointQuerySelfAttnSimCCHead(_BaseJointQuerySimCCHead):
@@ -844,6 +1186,7 @@ HEAD_REGISTRY = {
     'joint_query_simcc': JointQuerySimCCHead,
     'joint_query_self_attn_simcc': JointQuerySelfAttnSimCCHead,
     'couple_joint_query_self_attn_simcc': CoupleJointQuerySelfAttnSimCCHead,
+    'temporal_joint_query_self_attn_simcc': TemporalJointQuerySelfAttnSimCCHead,
 }
 
 
@@ -946,7 +1289,40 @@ class DinoCC(nn.Module):
         return checkpoint
 
 
-    def forward(self, pixel_values, role=None, spatial=None):
+    def forward(
+        self,
+        pixel_values,
+        role=None,
+        spatial=None,
+        return_cross_attn: bool = False,
+        joint_xy_normed=None,
+        joint_valid=None,
+    ):
+        temporal_len = None
+        if pixel_values.ndim == 5:
+            batch, temporal_len, channels, height, width = pixel_values.shape
+            pixel_values = pixel_values.reshape(batch * temporal_len, channels, height, width)
+            if role is not None:
+                if role.ndim == 3:
+                    role = role.reshape(batch * temporal_len, role.shape[-1])
+                elif role.ndim == 2 and role.shape[0] == batch:
+                    role = role.unsqueeze(1).expand(batch, temporal_len, role.shape[-1])
+                    role = role.reshape(batch * temporal_len, role.shape[-1])
+            if spatial is not None:
+                if spatial.ndim == 3:
+                    spatial = spatial.reshape(batch * temporal_len, spatial.shape[-1])
+                elif spatial.ndim == 2 and spatial.shape[0] == batch:
+                    spatial = spatial.unsqueeze(1).expand(batch, temporal_len, spatial.shape[-1])
+                    spatial = spatial.reshape(batch * temporal_len, spatial.shape[-1])
+            if joint_xy_normed is not None and joint_xy_normed.ndim == 4:
+                joint_xy_normed = joint_xy_normed.reshape(
+                    batch * temporal_len, joint_xy_normed.shape[2], joint_xy_normed.shape[3]
+                )
+            if joint_valid is not None and joint_valid.ndim == 3:
+                joint_valid = joint_valid.reshape(
+                    batch * temporal_len, joint_valid.shape[2]
+                )
+
         # DINOv2 needs pos-encoding interpolation for non-native resolutions; DINOv3 uses RoPE
         if getattr(self.backbone.config, 'model_type', None) == 'dinov2':
             outputs = self.backbone(pixel_values=pixel_values, interpolate_pos_encoding=True)
@@ -955,7 +1331,25 @@ class DinoCC(nn.Module):
 
         patch_tokens = outputs.last_hidden_state[:, self.patch_token_start:, :]  # [B, N, C]
 
-        head_out = self.head(patch_tokens, role=role, spatial=spatial)
+        head_kwargs = {
+            'role': role,
+            'spatial': spatial,
+            'joint_xy_normed': joint_xy_normed,
+            'joint_valid': joint_valid,
+            'temporal_len': temporal_len,
+        }
+        if return_cross_attn:
+            if not isinstance(self.head, _BaseJointQuerySimCCHead):
+                raise ValueError(
+                    f'return_cross_attn requires a joint-query head; got {type(self.head).__name__}'
+                )
+            head_out = self.head(
+                patch_tokens, return_cross_attn=True, **head_kwargs
+            )
+        else:
+            head_out = self.head(patch_tokens, **head_kwargs)
+        if return_cross_attn:
+            return head_out
         if isinstance(head_out, tuple) and len(head_out) == 3:
             return head_out
         pred_x, pred_y = head_out
@@ -1038,7 +1432,8 @@ def generate_simcc_labels(
 class SimCCLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        # batchmean computes the mathematically rigorous KL-divergence over batches
+        # Keep the per-joint KL terms so the caller can apply visibility and
+        # joint weights before normalizing.
         self.kl = nn.KLDivLoss(reduction='none')
 
     def forward(self, pred_x, pred_y, target_x, target_y, weights):

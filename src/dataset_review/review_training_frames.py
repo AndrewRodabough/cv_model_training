@@ -1,13 +1,21 @@
+"""Interactive review of cleaned training frames.
+
+Examples:
+  python -m src.dataset_review.review_training_frames --version 1.4.0
+  python -m src.dataset_review.review_training_frames --version 1.4.0 --video-id 7
+  python -m src.dataset_review.review_training_frames --annotations path/to/cleaned_annotations.xml
+"""
+
 import argparse
-import hashlib
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import cv2
 import matplotlib.pyplot as plt
 
-from src.util.get_version import get_pose_estimator_version_folder
 from src.util.drawing import draw_person
+from src.util.get_version import get_pose_estimator_version_folder
+
 
 def main():
     parser = argparse.ArgumentParser(description='Review training frames one at a time.')

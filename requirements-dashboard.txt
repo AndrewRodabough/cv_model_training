@@ -1,0 +1,12 @@
+# Lightweight deps for `python -m src.dashboard.app` (separate from training env).
+# Keep Gradio 4.x with a FastAPI/Starlette pair that still works with Jinja templates.
+# (fastapi 0.16x + starlette 1.x breaks Gradio 4.44's TemplateResponse.)
+gradio==4.44.1
+fastapi==0.115.6
+starlette==0.41.3
+huggingface_hub>=0.25.2,<0.26
+matplotlib>=3.7
+numpy>=1.24,<2.3
+Pillow>=10.0
+PyYAML>=6.0
+jinja2>=3.1.4,<3.2

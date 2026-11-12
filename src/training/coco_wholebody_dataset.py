@@ -253,8 +253,12 @@ def mix_dance_with_coco(
     coco_pool: list[Sample],
     dance_fraction: float,
     seed: int,
-) -> tuple[list[Sample], int]:
-    """Subsample COCO to the target mix, concatenate with dance, and shuffle."""
+) -> tuple[list[Sample], int, set[str]]:
+    """Subsample COCO to the target mix, concatenate with dance, and shuffle.
+
+    Returns ``(mixed_samples, n_coco, coco_path_set)`` where ``coco_path_set`` holds
+    resolved path strings for the COCO subset (for per-source train loss).
+    """
     coco_train = subsample_coco_for_dance_fraction(
         coco_pool,
         len(dance_samples),
@@ -264,10 +268,12 @@ def mix_dance_with_coco(
     mixed: list[Sample] = list(dance_samples) + list(coco_train)
     rng = random.Random(seed + 31)
     rng.shuffle(mixed)
-    return mixed, len(coco_train)
+    coco_paths = {str(Path(path).resolve()) for path, *_ in coco_train}
+    return mixed, len(coco_train), coco_paths
 
 
-def mean_labeled_joints(samples: list[Sample]) -> float:
+def mean_labeled_joints(samples: list) -> float:
+    """Mean labeled-joint count. Dance samples may be longer than COCO 4-tuples."""
     if not samples:
         return 0.0
-    return float(np.mean([_count_labeled(k) for _, k, _, _ in samples]))
+    return float(np.mean([_count_labeled(sample[1]) for sample in samples]))

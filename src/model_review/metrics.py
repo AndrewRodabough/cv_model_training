@@ -13,30 +13,18 @@ import torch.nn.functional as F
 
 
 OKS_THRESHOLDS = np.arange(0.50, 1.00, 0.05)
+ROBUST_TAIL_COUNT = 10
+ROBUST_TAIL_FRACTION = 0.10
 
-# Local joint-name groups for dance_23-style formats (resolved via keypoint map).
-BODY_PART_JOINT_NAMES: dict[str, tuple[str, ...]] = {
-    'head': ('ear_l', 'ear_r', 'glabella'),
-    'arms': (
-        'shoulder_l',
-        'shoulder_r',
-        'elbow_l',
-        'elbow_r',
-        'wrist_l',
-        'wrist_r',
-    ),
-    'legs': ('hip_l', 'hip_r', 'knee_l', 'knee_r', 'ankle_l', 'ankle_r'),
-    'feet': (
-        'toe_b_l',
-        'toe_s_l',
-        'heel_l',
-        'heel_spike_l',
-        'toe_b_r',
-        'toe_s_r',
-        'heel_r',
-        'heel_spike_r',
-    ),
-}
+# Re-export torch-free breakdown helpers / constants for training callers.
+from src.util.oks_breakdown import (  # noqa: E402
+    BODY_PART_HISTORY_ORDER,
+    BODY_PART_JOINT_NAMES,
+    OKS_PERCENTILE_BANDS,
+    oks_percentile_band_means,
+    part_mean_oks_from_joint_arrays,
+    part_mean_oks_from_metrics,
+)
 
 
 def resolve_body_part_indices(keypoints_by_name: dict) -> dict[str, list[int]]:
@@ -238,15 +226,99 @@ def _safe_mean(values: np.ndarray) -> float:
     return float(np.mean(values))
 
 
-def _subset_metrics(scores: np.ndarray, oks_values: np.ndarray, losses: np.ndarray) -> dict[str, float]:
+def _subset_metrics(
+    scores: np.ndarray,
+    oks_values: np.ndarray,
+    losses: np.ndarray,
+    *,
+    include_robust_tail: bool = True,
+) -> dict[str, Any]:
     ap_suite = average_precision_suite(scores, oks_values)
-    return {
+    metrics: dict[str, Any] = {
         **ap_suite,
         'mean_OKS': _safe_mean(oks_values),
         'std_OKS': _safe_std(oks_values),
         'mean_loss': _safe_mean(losses),
         'std_loss': _safe_std(losses),
         'num_samples': int(len(oks_values)),
+    }
+    if include_robust_tail:
+        metrics['worst_case'] = _worst_case_metrics(scores, oks_values, losses)
+    return metrics
+
+
+def _tail_subset_metrics(
+    scores: np.ndarray,
+    oks_values: np.ndarray,
+    losses: np.ndarray,
+) -> dict[str, Any]:
+    """Compute metrics for a loss-ranked tail without recursively adding tails."""
+    return _subset_metrics(
+        scores,
+        oks_values,
+        losses,
+        include_robust_tail=False,
+    )
+
+
+def _worst_case_metrics(
+    scores: np.ndarray,
+    oks_values: np.ndarray,
+    losses: np.ndarray,
+) -> dict[str, Any]:
+    """Expose performance on high-loss samples alongside the global metrics.
+
+    This is diagnostic rather than a replacement for standard AP. The tail is
+    selected using the already computed per-sample loss, so it does not depend
+    on an arbitrary OKS threshold or confidence cutoff.
+    """
+    if len(oks_values) == 0:
+        empty = _tail_subset_metrics(
+            np.array([]),
+            np.array([]),
+            np.array([]),
+        )
+        return {
+            'worst_10': {**empty, 'loss_share': 0.0},
+            'bottom_10_percent': {**empty, 'loss_share': 0.0},
+            'excluding_worst_10_percent': {**empty, 'excluded_loss_share': 0.0},
+        }
+
+    total_loss = float(np.sum(losses))
+    order = np.argsort(-losses, kind='stable')
+    tail_count = min(ROBUST_TAIL_COUNT, len(order))
+    percentile_count = max(1, int(np.ceil(len(order) * ROBUST_TAIL_FRACTION)))
+    retained_indices = order[percentile_count:]
+
+    def build_tail(count: int) -> dict[str, Any]:
+        indices = order[:count]
+        tail = _tail_subset_metrics(
+            scores[indices],
+            oks_values[indices],
+            losses[indices],
+        )
+        tail['loss_share'] = (
+            float(np.sum(losses[indices]) / total_loss)
+            if total_loss > 0
+            else 0.0
+        )
+        return tail
+
+    retained = _tail_subset_metrics(
+        scores[retained_indices],
+        oks_values[retained_indices],
+        losses[retained_indices],
+    )
+    retained['excluded_loss_share'] = (
+        float(np.sum(losses[order[:percentile_count]]) / total_loss)
+        if total_loss > 0
+        else 0.0
+    )
+
+    return {
+        'worst_10': build_tail(tail_count),
+        'bottom_10_percent': build_tail(percentile_count),
+        'excluding_worst_10_percent': retained,
     }
 
 
@@ -306,6 +378,39 @@ def _body_part_class_metrics(
     return metrics
 
 
+def _per_keypoint_metrics(
+    samples: list[dict[str, Any]],
+    keypoint_names: list[str],
+    visibility: int | None = None,
+) -> dict[str, dict[str, float]]:
+    """OKS-AP for each keypoint independently across people."""
+    metrics: dict[str, dict[str, float]] = {}
+    for joint_index, name in enumerate(keypoint_names):
+        subset = [
+            sample
+            for sample in samples
+            if sample.get('per_keypoints')
+            and (
+                visibility is None
+                or sample['per_keypoints'][joint_index]['visibility'] == visibility
+            )
+            and sample['per_keypoints'][joint_index]['oks'] is not None
+        ]
+        scores = np.asarray(
+            [sample['per_keypoints'][joint_index]['score'] for sample in subset],
+            dtype=np.float64,
+        )
+        oks_values = np.asarray(
+            [sample['per_keypoints'][joint_index]['oks'] for sample in subset],
+            dtype=np.float64,
+        )
+        losses = np.asarray([sample['loss'] for sample in subset], dtype=np.float64)
+        item = _subset_metrics(scores, oks_values, losses)
+        item['num_people_with_keypoint'] = int(len(subset))
+        metrics[name] = item
+    return metrics
+
+
 def summarize_body_part_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Global (not per-task) OKS-AP for head / arms / legs / feet."""
     part_names = list(BODY_PART_JOINT_NAMES.keys())
@@ -321,9 +426,55 @@ def summarize_body_part_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def summarize_per_keypoint_metrics(
+    samples: list[dict[str, Any]],
+    keypoint_names: list[str],
+) -> dict[str, Any]:
+    """Global OKS-AP for each labeled keypoint independently."""
+    return {
+        'description': (
+            'Person-level OKS-AP restricted to one keypoint at a time. '
+            'Same OKS/AP thresholds as primary; people with an unlabeled '
+            'keypoint are omitted. Ranking score is that keypoint confidence.'
+        ),
+        'keypoints': _per_keypoint_metrics(samples, keypoint_names),
+    }
+
+
+def summarize_visible_per_keypoint_metrics(
+    samples: list[dict[str, Any]],
+    keypoint_names: list[str],
+) -> dict[str, dict[str, float]]:
+    return _per_keypoint_metrics(samples, keypoint_names, visibility=2)
+
+
+def summarize_visibility_fraction_by_keypoint(
+    samples: list[dict[str, Any]],
+    keypoint_names: list[str],
+) -> dict[str, dict[str, float]]:
+    result: dict[str, dict[str, float]] = {}
+    for joint_index, name in enumerate(keypoint_names):
+        values = [
+            sample['per_keypoints'][joint_index]['visibility']
+            for sample in samples
+            if sample.get('per_keypoints')
+            and sample['per_keypoints'][joint_index]['visibility'] in (1, 2)
+        ]
+        v1 = sum(value == 1 for value in values)
+        v2 = sum(value == 2 for value in values)
+        result[name] = {
+            'v1_fraction': v1 / (v1 + v2) if v1 + v2 else 0.0,
+            'v1_count': v1,
+            'v2_count': v2,
+            'labeled_count': v1 + v2,
+        }
+    return result
+
+
 def summarize_custom_metrics(
     samples: list[dict[str, Any]],
     ownership: dict[str, Any] | None = None,
+    keypoint_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Extra eval suites that do not replace primary OKS-AP.
 
@@ -350,6 +501,21 @@ def summarize_custom_metrics(
         },
         'body_parts': summarize_body_part_metrics(samples),
     }
+    if keypoint_names is not None:
+        custom['per_keypoint'] = summarize_per_keypoint_metrics(
+            samples, keypoint_names
+        )
+        custom['per_keypoint_visible'] = {
+            'description': (
+                'Per-keypoint OKS-AP restricted to joints with GT visibility v=2.'
+            ),
+            'keypoints': summarize_visible_per_keypoint_metrics(
+                samples, keypoint_names
+            ),
+        }
+        custom['visibility_fraction_by_keypoint'] = (
+            summarize_visibility_fraction_by_keypoint(samples, keypoint_names)
+        )
     if ownership is not None:
         custom['ownership'] = {
             'description': (
@@ -364,6 +530,7 @@ def summarize_custom_metrics(
 def summarize_pose_metrics(
     samples: list[dict[str, Any]],
     ownership: dict[str, Any] | None = None,
+    keypoint_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate global and per-video OKS-AP / loss metrics.
 
@@ -376,7 +543,9 @@ def summarize_pose_metrics(
             **empty,
             'std_AP_across_videos': 0.0,
             'per_video': {},
-            'custom': summarize_custom_metrics([], ownership=ownership),
+            'custom': summarize_custom_metrics(
+                [], ownership=ownership, keypoint_names=keypoint_names
+            ),
         }
 
     scores = np.asarray([sample['score'] for sample in samples], dtype=np.float64)
@@ -403,7 +572,10 @@ def summarize_pose_metrics(
         **global_metrics,
         'std_AP_across_videos': _safe_std(np.asarray(video_aps, dtype=np.float64)),
         'per_video': per_video,
-        'custom': summarize_custom_metrics(samples, ownership=ownership),
+        'oks_percentile_bands': oks_percentile_band_means(oks_values),
+        'custom': summarize_custom_metrics(
+            samples, ownership=ownership, keypoint_names=keypoint_names
+        ),
     }
 
 
@@ -417,6 +589,30 @@ def format_metrics_summary(checkpoint_name: str, metrics: dict[str, Any]) -> str
             f'n={metrics["num_samples"]}'
         )
     ]
+    worst_case = metrics.get('worst_case') or {}
+    for label in (
+        'worst_10',
+        'bottom_10_percent',
+        'excluding_worst_10_percent',
+    ):
+        tail = worst_case.get(label)
+        if tail:
+            loss_field = (
+                'excluded_loss_share'
+                if label == 'excluding_worst_10_percent'
+                else 'loss_share'
+            )
+            loss_label = (
+                'excluded_loss_share'
+                if label == 'excluding_worst_10_percent'
+                else 'loss_share'
+            )
+            lines.append(
+                f'  [{label}] AP={tail["AP"]:.3f}  AP50={tail["AP50"]:.3f}  '
+                f'AP75={tail["AP75"]:.3f}  mean_OKS={tail["mean_OKS"]:.3f}  '
+                f'mean_loss={tail["mean_loss"]:.4f}  '
+                f'{loss_label}={tail[loss_field]:.3f}  n={tail["num_samples"]}'
+            )
     for video_id, video_metrics in metrics.get('per_video', {}).items():
         lines.append(
             f'  {video_id:<12} AP={video_metrics["AP"]:.3f}  '

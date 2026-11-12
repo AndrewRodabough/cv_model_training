@@ -1,0 +1,18 @@
+annotation_version: 1.0.3
+image_version: 0
+export_version: 2026-11-11_000
+date: 2026-11-11
+description: 'Detector 1.0.3: tasks 58/59 + main/side tiers (side=no skeleton)'
+changes:
+  - Ingest task 58/59 images
+  - Tag main vs side by skeleton person_id
+  - Include side background people for recall-weighted training
+  - Updated completeness allowlist (background_labeled 2/5/7/9/10)
+statistics:
+  frames_used: 4770
+  tasks_used: 29
+  tracks: 85
+  track_frames: 9839
+  main_boxes: 8873
+  side_boxes: 966
+  images_ingested: 1510

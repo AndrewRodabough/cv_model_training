@@ -9,6 +9,10 @@ from pathlib import Path
 import yaml
 
 from src.dataset_review.export_bbox_detection import export_detection_dataset
+from src.training.yolo_partial_label import (
+    enable_partial_label_loss,
+    load_full_cls_task_ids,
+)
 
 
 def load_config(path: Path) -> dict:
@@ -35,6 +39,11 @@ def maybe_export(cfg: dict, images: Path | None) -> Path:
         min_track_length=int(dataset_cfg.get('min_track_length', 10)),
         frame_stride=dataset_cfg.get('frame_stride'),
         soft_band=float(dataset_cfg.get('soft_band', 0.0)),
+        val_tasks=dataset_cfg.get('val_tasks') or dataset_cfg.get('test_clips'),
+        pseudo_fill_unlabeled=bool(dataset_cfg.get('pseudo_fill_unlabeled', False)),
+        pseudo_teacher=str(dataset_cfg.get('pseudo_teacher', 'yolo11m.pt')),
+        pseudo_conf=float(dataset_cfg.get('pseudo_conf', 0.25)),
+        pseudo_device=str(dataset_cfg.get('pseudo_device', 'cpu')),
     )
     data_yaml = output_root / 'data.yaml'
     if not data_yaml.is_file():
@@ -53,6 +62,33 @@ def train(cfg: dict, *, data_yaml: Path, device: str | None, resume: bool) -> Pa
     model_cfg = cfg['model']
     train_cfg = cfg['training']
     model = YOLO(model_cfg['name'])
+
+    # Sparse keypoint-driven boxes: mask cls outside GT (crowd not = background).
+    # Optional allowlist restores full cls on tasks tagged label-complete / safe-bg.
+    mask_outside = bool(train_cfg.get('mask_outside_gt', False))
+    pos_only = bool(train_cfg.get('positive_only_cls', False))
+    full_cls_tasks: set[str] = set()
+    completeness = train_cfg.get('label_completeness_yaml')
+    if completeness:
+        full_cls_tasks = load_full_cls_task_ids(completeness)
+    for raw in train_cfg.get('full_cls_tasks') or []:
+        full_cls_tasks.add(str(raw).removeprefix('task_'))
+    # Always enable when side-tier weights or masking are requested.
+    side_cls = float(train_cfg.get('side_cls_weight', 0.5))
+    side_box = float(train_cfg.get('side_box_weight', 0.2))
+    use_side_weights = bool(train_cfg.get('side_tier_weights', True))
+    if mask_outside or pos_only or use_side_weights:
+        enable_partial_label_loss(
+            model,
+            mask_outside_gt=mask_outside,
+            gt_mask_dilate=float(train_cfg.get('gt_mask_dilate', 1.15)),
+            positive_only_cls=pos_only,
+            neg_weight=float(train_cfg.get('background_cls_weight', 0.0)),
+            full_cls_task_ids=full_cls_tasks,
+            side_cls_weight=side_cls if use_side_weights else 1.0,
+            side_box_weight=side_box if use_side_weights else 1.0,
+            side_class_id=int(train_cfg.get('side_class_id', 1)),
+        )
 
     kwargs = {
         'data': str(data_yaml.resolve()),
@@ -73,6 +109,10 @@ def train(cfg: dict, *, data_yaml: Path, device: str | None, resume: bool) -> Pa
         kwargs['device'] = device
     if 'lr0' in train_cfg:
         kwargs['lr0'] = float(train_cfg['lr0'])
+    if 'optimizer' in train_cfg:
+        kwargs['optimizer'] = str(train_cfg['optimizer'])
+    if 'save_period' in train_cfg:
+        kwargs['save_period'] = int(train_cfg['save_period'])
 
     results = model.train(**kwargs)
     save_dir = Path(results.save_dir)
@@ -121,6 +161,14 @@ def main():
                 min_track_length=int(cfg['dataset'].get('min_track_length', 10)),
                 frame_stride=cfg['dataset'].get('frame_stride'),
                 soft_band=float(cfg['dataset'].get('soft_band', 0.0)),
+                val_tasks=cfg['dataset'].get('val_tasks')
+                or cfg['dataset'].get('test_clips'),
+                pseudo_fill_unlabeled=bool(
+                    cfg['dataset'].get('pseudo_fill_unlabeled', False)
+                ),
+                pseudo_teacher=str(cfg['dataset'].get('pseudo_teacher', 'yolo11m.pt')),
+                pseudo_conf=float(cfg['dataset'].get('pseudo_conf', 0.25)),
+                pseudo_device=str(cfg['dataset'].get('pseudo_device', 'cpu')),
             )
         else:
             data_yaml = maybe_export(cfg, args.images)

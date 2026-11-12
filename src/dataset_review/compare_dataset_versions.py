@@ -6,11 +6,11 @@ Default base version:
   - 1.7.0 → last version under 1.6.X (e.g. 1.6.5)
 
 Examples:
-  python compare_dataset_versions.py 1.6.5
-  python compare_dataset_versions.py 1.6.0
-  python compare_dataset_versions.py 1.6.5 --base-version 1.6.3
-  python compare_dataset_versions.py 1.6.5 --list-only
-  python compare_dataset_versions.py 1.6.5 --show removed
+  python -m src.dataset_review.compare_dataset_versions 1.6.5
+  python -m src.dataset_review.compare_dataset_versions 1.6.0
+  python -m src.dataset_review.compare_dataset_versions 1.6.5 --base-version 1.6.3
+  python -m src.dataset_review.compare_dataset_versions 1.6.5 --list-only
+  python -m src.dataset_review.compare_dataset_versions 1.6.5 --show removed
 """
 
 import argparse

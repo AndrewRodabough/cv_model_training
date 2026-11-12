@@ -1,0 +1,15 @@
+annotation_version: 1.7.9
+image_version: 0
+export_version: 2026-10-27_000
+date: '2026-10-27'
+description: added new tasks and frames
+changes:
+  - added task 56
+  - added task 54
+  - added task 53
+statistics:
+  frames_used: 643
+  tasks_used: x
+  tracks: 67
+  track_frames: 1071
+keypoints_used: [0, 1, 2, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]

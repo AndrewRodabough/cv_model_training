@@ -247,7 +247,7 @@ def evaluate_best_pt(
         role_batch = []
         scales = []
 
-        for image_path, keypoints, bbox, role in batch:
+        for image_path, keypoints, bbox, role, *_ in batch:
             image = Image.open(image_path).convert('RGB')
             crop_x1, crop_y1, crop_width, crop_height = train_mod.compute_padded_crop(
                 bbox, image.width, image.height
@@ -297,7 +297,7 @@ def evaluate_best_pt(
         keypoints_np = keypoints_tensor.numpy()
         losses_np = sample_losses.detach().cpu().numpy()
 
-        for offset, (image_path, _keypoints, _bbox, _role) in enumerate(batch):
+        for offset, (image_path, _keypoints, _bbox, _role, *_) in enumerate(batch):
             gt_full = keypoints_np[offset]
             pred_full = coords_np[offset]
             conf_full = conf_np[offset]
@@ -336,7 +336,7 @@ def collect_vitpose_predictions(
     by_image: dict[Path, list[tuple[int, np.ndarray, tuple[float, float, float, float]]]] = (
         defaultdict(list)
     )
-    for index, (image_path, keypoints, bbox, _role) in enumerate(test_samples):
+    for index, (image_path, keypoints, bbox, _role, *_) in enumerate(test_samples):
         by_image[Path(image_path)].append((index, keypoints, bbox))
 
     out: list[dict[str, Any] | None] = [None] * len(test_samples)

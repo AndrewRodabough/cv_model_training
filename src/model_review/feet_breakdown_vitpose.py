@@ -48,7 +48,7 @@ def cache_model_preds(model, checkpoint, test_samples, device, batch_size):
         kps_batch = []
         role_batch = []
         scales = []
-        for image_path, keypoints, bbox, role in batch:
+        for image_path, keypoints, bbox, role, *_ in batch:
             image = Image.open(image_path).convert('RGB')
             crop_x1, crop_y1, crop_width, crop_height = train_mod.compute_padded_crop(
                 bbox, image.width, image.height
@@ -78,10 +78,12 @@ def cache_model_preds(model, checkpoint, test_samples, device, batch_size):
         pixels_tensor = torch.stack(pixels_batch).to(device)
         role_tensor = torch.stack(role_batch).to(device)
         with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-            pred_x, pred_y = model(
+            model_out = model(
                 pixels_tensor,
                 role=role_tensor if train_mod.USE_ROLE else None,
             )
+            # Deep-supervision heads return (pred_x, pred_y, aux); use primary only.
+            pred_x, pred_y = model_out[0], model_out[1]
             coords, _ = decode_simcc(pred_x, pred_y, train_mod.SIMCC_SPLIT_RATIO)
         coords_np = coords.detach().cpu().numpy()
         kps_np = torch.stack(kps_batch).numpy()

@@ -1,0 +1,15 @@
+annotation_version: 1.8.0
+image_version: 0
+export_version: 2026-11-05_000
+date: '2026-11-05'
+description: Added dense annoation to 3 new tasks
+changes:
+  - added dense annotation to task 13
+  - added dense annotation to task 21
+  - added dense annotation to task 53
+statistics:
+  frames_used: 856
+  tasks_used: x
+  tracks: 69
+  track_frames: 1326
+keypoints_used: [0, 1, 2, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]

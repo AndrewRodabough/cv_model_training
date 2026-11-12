@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """List cleaned frames for one task in a dataset annotation version.
 
-Uses the same selection rules as dataset_parser.py:
+Uses the same selection rules as dataset_parser:
   - frame_cleaned=true → include
   - cleaned=true + cleaned_completion=N → every Nth relative frame
-"""
 
+Examples:
+  python -m src.dataset_review.list_cleaned_frames --version 1.5.0 --task 7
+  python -m src.dataset_review.list_cleaned_frames --version 1.5.0 --task 7 --source cleaned
+"""
 
 import argparse
 import xml.etree.ElementTree as ET
+
 import yaml
+
+from src.util.dir import IMAGES_DIR
 from src.util.get_frame import list_cleaned_frames
 from src.util.get_version import (
     get_export_file_path,
     get_pose_estimator_version_folder,
 )
-from src.util.dir import IMAGES_DIR
 
 
 def main():
@@ -38,7 +43,8 @@ def main():
         annotations_file = dataset_dir / 'cleaned_annotations.xml'
         if not annotations_file.is_file():
             raise FileNotFoundError(
-                f'Missing {annotations_file}; run: python dataset_parser.py {args.version}'
+                f'Missing {annotations_file}; run: '
+                f'python -m src.dataset_review.dataset_parser {args.version}'
             )
         # cleaned XML already stores relative frame numbers and persons.
         root = ET.parse(annotations_file).getroot()

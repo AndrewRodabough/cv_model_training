@@ -296,14 +296,14 @@ def build_annotations(
                 # BBox tracks can have gaps (e.g. after outside=1) even when the skeleton
                 # was marked frame_cleaned; skip rather than fail the whole build.
                 print(
-                    f'Warning: missing bbox for skeleton track {track.get("id")} '
-                    f'at frame {frame}; skipping.'
+                    f'Warning: missing bbox for skeleton on task {task_id} '
+                    f'at frame {relative_frame}; skipping.'
                 )
                 continue
             if bbox_shape.get('outside') == '1':
                 print(
-                    f'Warning: outside bbox for skeleton track {track.get("id")} '
-                    f'at frame {frame}; skipping.'
+                    f'Warning: outside bbox for skeleton on task {task_id} '
+                    f'at frame {relative_frame}; skipping.'
                 )
                 continue
 

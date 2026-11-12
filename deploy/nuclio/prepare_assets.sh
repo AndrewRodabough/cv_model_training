@@ -1,31 +1,47 @@
 #!/usr/bin/env bash
-# Stage code + checkpoint into deploy/nuclio and sync to cvat_annotation_tools.
+# Stage the Nuclio package and optionally sync it to cvat_annotation_tools.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANNOTATION_TOOLS_DEST="${ANNOTATION_TOOLS_DEST:-${ROOT}/../cvat_annotation_tools/nuclio/dinocc}"
-DEFAULT_CHECKPOINT="${ROOT}/training/runs/2026_10_09_007/best.pt"
+PYTHON="${PYTHON:-python3}"
+DEFAULT_CHECKPOINT="${ROOT}/training/pose_estimator_runs/2026_10_16_005/final.pt"
 
 CHECKPOINT="${1:-}"
 if [[ -z "${CHECKPOINT}" ]]; then
   if [[ -f "${DEFAULT_CHECKPOINT}" ]]; then
     CHECKPOINT="${DEFAULT_CHECKPOINT}"
   else
-    CHECKPOINT="$(ls -1dt "${ROOT}"/training/runs/*/best.pt 2>/dev/null | head -1 || true)"
+    CHECKPOINT="$("${PYTHON}" - "${ROOT}/training/pose_estimator_runs" <<'PY'
+import sys
+from pathlib import Path
+
+run_root = Path(sys.argv[1])
+checkpoints = sorted(
+    run_root.glob("*/final.pt"),
+    key=lambda path: path.stat().st_mtime,
+    reverse=True,
+)
+print(checkpoints[0] if checkpoints else "")
+PY
+)"
   fi
 fi
 if [[ -z "${CHECKPOINT}" || ! -f "${CHECKPOINT}" ]]; then
-  echo "Usage: $0 [path/to/best.pt]" >&2
-  echo "No checkpoint found under training/runs/*/best.pt" >&2
+  echo "Usage: $0 [path/to/checkpoint.pt]" >&2
+  echo "No checkpoint found under training/pose_estimator_runs/*/final.pt" >&2
   exit 1
 fi
 
-echo "Syncing model code from repo root..."
 mkdir -p "${DEST}/mapping" "${DEST}/weights" "${DEST}/backbone"
-cp -f "${ROOT}/dino_cc.py" "${DEST}/dino_cc.py"
-cp -f "${ROOT}/vec.py" "${DEST}/vec.py"
-cp -f "${ROOT}/mapping/dance_23.yaml" "${DEST}/mapping/dance_23.yaml"
+for required_file in "${DEST}/main.py" "${DEST}/dino_cc.py" "${DEST}/vec.py" \
+  "${DEST}/function_gpu.yaml" "${DEST}/mapping/dance_23.yaml"; do
+  if [[ ! -f "${required_file}" ]]; then
+    echo "Missing Nuclio package file: ${required_file}" >&2
+    exit 1
+  fi
+done
 
 echo "Copying checkpoint: ${CHECKPOINT}"
 CHECKPOINT_ABS="$(cd "$(dirname "${CHECKPOINT}")" && pwd)/$(basename "${CHECKPOINT}")"
@@ -35,7 +51,7 @@ if [[ "${CHECKPOINT_ABS}" != "${DEST_CKPT}" ]]; then
 fi
 
 BACKBONE_ID="$(
-  python3 - "${CHECKPOINT}" <<'PY'
+  "${PYTHON}" - "${CHECKPOINT}" <<'PY'
 import sys
 import torch
 ck = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
@@ -44,7 +60,7 @@ PY
 )"
 
 echo "Refreshing backbone config for ${BACKBONE_ID} (config-only, no weight download)..."
-python3 - "${BACKBONE_ID}" "${DEST}/backbone" <<'PY'
+"${PYTHON}" - "${BACKBONE_ID}" "${DEST}/backbone" <<'PY'
 import sys
 from pathlib import Path
 
@@ -102,9 +118,8 @@ fi
 du -h "${DEST}/weights/best.pt" "${DEST}/backbone/config.json"
 cat <<EOF
 Ready. Deploy with:
-  ~/cvat/serverless/deploy_gpu.sh ${ANNOTATION_TOOLS_DEST}
-# or:
-  nuctl deploy --project-name cvat \\
+  nuctl deploy pth-dinocc-dance-23 \\
+    --project-name cvat \\
     --path ${DEST} \\
     --file ${DEST}/function_gpu.yaml \\
     --platform local \\

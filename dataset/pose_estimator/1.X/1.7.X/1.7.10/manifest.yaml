@@ -1,0 +1,14 @@
+annotation_version: 1.7.10
+image_version: 0
+export_version: 2026-10-29_001
+date: '2026-10-29'
+description: task 57 (white-lead / car-wash-follow) with corrected frames
+changes:
+  - added task 57 (white lead, car-wash pants follow; stacked camera-facing occlusion)
+  - corrected task 57 frame export
+statistics:
+  frames_used: 651
+  tasks_used: x
+  tracks: 69
+  track_frames: 1087
+keypoints_used: [0, 1, 2, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]

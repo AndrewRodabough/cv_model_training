@@ -12,7 +12,33 @@ Code for training top-down human pose estimation on dance videos, plus person/co
 
 ## Pose training
 
-Pose crops still come from GT boxes in `cleaned_annotations.xml` (skeleton-gated). See `config_template.yaml` and `train.py`.
+Pose crops still come from GT boxes in `cleaned_annotations.xml` (skeleton-gated). See `config_pose.yaml` / `config_pose_template.yaml` and `src/training/train.py`.
+
+### Training observability dashboard
+
+Local Gradio UI to edit configs, start/pause/stop runs, watch live loss curves, and scrub val predictions by epoch.
+
+```bash
+# One-time: dedicated lightweight venv (avoids Gradio vs training-env conflicts)
+python -m venv .venv-dashboard
+.venv-dashboard/bin/pip install -r requirements-dashboard.txt
+
+# Launch UI (http://127.0.0.1:7860)
+cd /path/to/cv_model_training
+PYTHONPATH=. TRAIN_PYTHON=/home/arodabough/anaconda3/envs/dino/bin/python \
+  .venv-dashboard/bin/python -m src.dashboard.app
+```
+
+`TRAIN_PYTHON` should point at the env that has torch / DINOv3 (e.g. `dino`). The dashboard process itself stays CPU-only.
+
+Each run folder under `runs/pose_estimator/YYYY_MM_DD_NNN/` now also writes:
+- `history.jsonl` — per-epoch train/val loss, components, optional AP
+- `status.json` / `control.json` — live state + pause/resume/stop
+- `val_preds/epoch_XXX.npz` — all val pred/gt coords + loss/OKS
+- `val_overlays/epoch_XXX/` — worst-N (+ watchlist) JPG overlays
+- `val_samples.json` — full per-sample records at end of run
+
+Config knobs (under `training:`): `save_val_preds_every_n_epochs`, `epoch_overlay_top_n`, `watchlist_frames`.
 
 ## Bbox detection training
 
@@ -51,3 +77,28 @@ python eval_detector.py \
 Requires `ultralytics` (`pip install ultralytics`). Outputs land under `dataset/detection/` (gitignored) and `training/detector_runs/`.
 
 COCO JSONs under `dataset/detection/<version>/<policy>/annotations/` can later feed an RTMDet fine-tune for production drop-in; this branch uses YOLO for fast label-policy experiments.
+
+## Nuclio pose deployment
+
+The CVAT Nuclio package is under `deploy/nuclio/`. It contains the standalone
+handler, model implementation, `dance_23` mapping, DINOv3 backbone configuration,
+and staged weights. To stage a pose-estimator checkpoint and deploy it locally:
+
+```bash
+PYTHON=/home/arodabough/anaconda3/envs/dino/bin/python \
+  deploy/nuclio/prepare_assets.sh \
+  runs/pose_estimator/2026_10_16_005/final.pt
+
+nuctl deploy pth-dinocc-dance-23 \
+  --project-name cvat \
+  --path "$PWD/deploy/nuclio" \
+  --file "$PWD/deploy/nuclio/function_gpu.yaml" \
+  --platform local \
+  --resource-limit nvidia.com/gpu=1
+```
+
+If no checkpoint argument is supplied, `prepare_assets.sh` uses
+`runs/pose_estimator/2026_10_16_005/final.pt`, or the newest
+`runs/pose_estimator/*/final.pt` when that file is unavailable. The script also
+syncs the package to the sibling `cvat_annotation_tools/nuclio/dinocc` directory
+when that checkout exists.

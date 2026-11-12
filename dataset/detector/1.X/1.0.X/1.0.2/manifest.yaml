@@ -1,0 +1,13 @@
+annotation_version: 1.0.2
+image_version: 0
+export_version: 2026-11-05_001
+date: 2026-11-07
+description: Cleaned bbox cut from latest CVAT export
+changes:
+  - Include newly cleaned tasks from 2026-11-05_001
+  - Train/val uses pose clip holdout (tasks 14/23/25/45/57)
+statistics:
+  frames_used: 4679
+  tasks_used: 28
+  tracks: 69
+  track_frames: 8678

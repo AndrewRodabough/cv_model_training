@@ -25,10 +25,15 @@ from src.dataset_review.dataset_parser import (
     shape_should_include,
     track_attribute_value,
 )
-from src.util.get_version import get_pose_estimator_version_folder
+from src.util.get_version import get_detector_version_folder
 
 PERSON_CATEGORY_ID = 1
 PERSON_CATEGORY = {'id': PERSON_CATEGORY_ID, 'name': 'person', 'supercategory': 'person'}
+# YOLO class ids: 0=main (has skeleton), 1=side (bbox only / background person)
+TIER_MAIN = 'main'
+TIER_SIDE = 'side'
+TIER_TO_CLASS = {TIER_MAIN: 0, TIER_SIDE: 1}
+CLASS_NAMES = {0: 'person', 1: 'person_side'}
 
 
 def bbox_iou(box_a, box_b) -> float:
@@ -107,6 +112,84 @@ def parse_box_xyxy(box_el) -> tuple[float, float, float, float]:
     )
 
 
+def collect_detector_boxes(
+    root: ET.Element,
+    *,
+    min_track_length: int,
+    frame_stride: int | None,
+):
+    """Read the detector annotation schema (videos/frames/person/bbox)."""
+    frames: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    track_lengths: dict[tuple[str, str], int] = defaultdict(int)
+    task_names: dict[str, str] = {}
+
+    for video in root.findall('./project/videos/video'):
+        task_id = video.get('id')
+        if task_id is None:
+            continue
+        task_names[task_id] = video.get('name', '')
+        for frame in video.findall('frame'):
+            for person in frame.findall('person'):
+                track_id = person.get('track_id', '')
+                track_lengths[(task_id, track_id)] += 1
+
+    skipped_short = 0
+    skipped_bad_boxes = 0
+    for video in root.findall('./project/videos/video'):
+        task_id = video.get('id')
+        if task_id is None:
+            continue
+        for frame in video.findall('frame'):
+            frame_number = frame.get('number')
+            if frame_number is None:
+                continue
+            relative_frame = int(frame_number)
+            if frame_stride is not None and frame_stride > 1 and relative_frame % frame_stride:
+                continue
+            for person in frame.findall('person'):
+                track_id = person.get('track_id', '')
+                if track_lengths[(task_id, track_id)] < min_track_length:
+                    skipped_short += 1
+                    continue
+                bbox = person.find('bbox')
+                if bbox is None:
+                    skipped_bad_boxes += 1
+                    continue
+                try:
+                    box = (
+                        float(bbox.get('x1')),
+                        float(bbox.get('y1')),
+                        float(bbox.get('x2')),
+                        float(bbox.get('y2')),
+                    )
+                except (TypeError, ValueError):
+                    skipped_bad_boxes += 1
+                    continue
+                if box[2] <= box[0] or box[3] <= box[1]:
+                    skipped_bad_boxes += 1
+                    continue
+                role = person.get('role')
+                tier = (person.get('tier') or TIER_MAIN).lower()
+                if tier not in TIER_TO_CLASS:
+                    tier = TIER_MAIN
+                frames[(task_id, relative_frame)].append(
+                    {
+                        'track_id': track_id,
+                        'person_id': person.get('person_id'),
+                        'role': role.lower() if role else None,
+                        'couple_id': person.get('couple_id'),
+                        'tier': tier,
+                        'bbox': box,
+                    }
+                )
+
+    return frames, task_names, {
+        'skipped_short_tracks': skipped_short,
+        'skipped_bad_boxes': skipped_bad_boxes,
+        'tasks': len(task_names),
+    }
+
+
 def collect_cleaned_person_boxes(
     annotations_file: Path,
     *,
@@ -114,7 +197,14 @@ def collect_cleaned_person_boxes(
     frame_stride: int | None,
 ):
     """Return frames dict: (task_id, relative_frame) -> list of person dicts."""
-    root, _, tasks = load_project(annotations_file)
+    root = ET.parse(annotations_file).getroot()
+    if root.find('meta') is None:
+        return collect_detector_boxes(
+            root,
+            min_track_length=min_track_length,
+            frame_stride=frame_stride,
+        )
+    _, _, tasks = load_project(annotations_file)
     starts = task_start_frames(tasks)
     task_names = {tid: tasks[tid].findtext('name', '') for tid in tasks}
 
@@ -190,6 +280,8 @@ def collect_cleaned_person_boxes(
                     'person_id': shape_person,
                     'role': shape_role,
                     'couple_id': shape_couple,
+                    # Raw CVAT path has no tier; treat as main until cleaned XML.
+                    'tier': TIER_MAIN,
                     'bbox': box,
                 }
             )
@@ -261,8 +353,11 @@ def apply_label_policy(
     soft_band: float = 0.0,
     soft_mode: str = 'hard',
     decision_key: tuple | None = None,
-) -> tuple[list[tuple[float, float, float, float]], dict]:
-    """Return emitted xyxy boxes and stats for one frame.
+) -> tuple[list[tuple[float, float, float, float]], list[str], dict]:
+    """Return emitted xyxy boxes, parallel tiers, and stats for one frame.
+
+    Only **main** people participate in union/separate pairing. Side people are
+    always emitted as unpaired individual boxes (class person_side).
 
     soft_band > 0 with soft_mode='random' (train): pairs with IoU in
     [τ - soft_band, τ + soft_band] randomly get union OR separate (seeded by
@@ -271,67 +366,124 @@ def apply_label_policy(
     """
     stats = {
         'input_people': len(people),
+        'input_main': 0,
+        'input_side': 0,
         'pairs': 0,
         'unions': 0,
         'separate_pairs': 0,
         'soft_pairs': 0,
         'unpaired': 0,
         'emitted': 0,
+        'emitted_main': 0,
+        'emitted_side': 0,
+        'box_kinds': [],  # parallel to emitted boxes: union | separate | unpaired
     }
     if not people:
-        return [], stats
+        return [], [], stats
+
+    mains = [p for p in people if (p.get('tier') or TIER_MAIN) != TIER_SIDE]
+    sides = [p for p in people if (p.get('tier') or TIER_MAIN) == TIER_SIDE]
+    stats['input_main'] = len(mains)
+    stats['input_side'] = len(sides)
+
+    boxes: list[tuple[float, float, float, float]] = []
+    tiers: list[str] = []
+    kinds: list[str] = []
 
     if always_separate or union_iou_threshold is None:
-        boxes = [p['bbox'] for p in people]
-        stats['emitted'] = len(boxes)
-        stats['unpaired'] = len(people)
-        return boxes, stats
+        for person in mains:
+            boxes.append(person['bbox'])
+            tiers.append(TIER_MAIN)
+            kinds.append('unpaired')
+        stats['unpaired'] += len(mains)
+    else:
+        pairs = pair_people(mains)
+        stats['pairs'] = len(pairs)
+        paired_ids = {id(person) for pair in pairs for person in pair}
+        tau = float(union_iou_threshold)
+        soft_low = tau - soft_band
+        soft_high = tau + soft_band
+        use_soft = soft_band > 0 and soft_mode == 'random'
 
-    pairs = pair_people(people)
-    stats['pairs'] = len(pairs)
-    paired_ids = {id(person) for pair in pairs for person in pair}
-    boxes = []
-    tau = float(union_iou_threshold)
-    soft_low = tau - soft_band
-    soft_high = tau + soft_band
-    use_soft = soft_band > 0 and soft_mode == 'random'
-
-    for pair_index, (person_a, person_b) in enumerate(pairs):
-        iou = bbox_iou(person_a['bbox'], person_b['bbox'])
-        do_union: bool
-        if use_soft and soft_low <= iou <= soft_high:
-            stats['soft_pairs'] += 1
-            # Deterministic per-frame/pair coin flip so re-exports are stable.
-            rng = random.Random(
-                repr(
-                    (
-                        decision_key if decision_key is not None else ('soft',),
-                        pair_index,
-                        round(iou, 4),
+        for pair_index, (person_a, person_b) in enumerate(pairs):
+            iou = bbox_iou(person_a['bbox'], person_b['bbox'])
+            do_union: bool
+            if use_soft and soft_low <= iou <= soft_high:
+                stats['soft_pairs'] += 1
+                rng = random.Random(
+                    repr(
+                        (
+                            decision_key if decision_key is not None else ('soft',),
+                            pair_index,
+                            round(iou, 4),
+                        )
                     )
                 )
-            )
-            do_union = rng.random() < 0.5
-        else:
-            do_union = iou >= tau
+                do_union = rng.random() < 0.5
+            else:
+                do_union = iou >= tau
 
-        if do_union:
-            boxes.append(union_bbox(person_a['bbox'], person_b['bbox']))
-            stats['unions'] += 1
-        else:
-            boxes.append(person_a['bbox'])
-            boxes.append(person_b['bbox'])
-            stats['separate_pairs'] += 1
-    for person in people:
-        if id(person) not in paired_ids:
-            boxes.append(person['bbox'])
-            stats['unpaired'] += 1
+            if do_union:
+                boxes.append(union_bbox(person_a['bbox'], person_b['bbox']))
+                tiers.append(TIER_MAIN)
+                kinds.append('union')
+                stats['unions'] += 1
+            else:
+                boxes.append(person_a['bbox'])
+                boxes.append(person_b['bbox'])
+                tiers.extend([TIER_MAIN, TIER_MAIN])
+                kinds.extend(['separate', 'separate'])
+                stats['separate_pairs'] += 1
+        for person in mains:
+            if id(person) not in paired_ids:
+                boxes.append(person['bbox'])
+                tiers.append(TIER_MAIN)
+                kinds.append('unpaired')
+                stats['unpaired'] += 1
+
+    for person in sides:
+        boxes.append(person['bbox'])
+        tiers.append(TIER_SIDE)
+        kinds.append('unpaired')
+        stats['unpaired'] += 1
+
     stats['emitted'] = len(boxes)
-    return boxes, stats
+    stats['emitted_main'] = sum(1 for t in tiers if t == TIER_MAIN)
+    stats['emitted_side'] = sum(1 for t in tiers if t == TIER_SIDE)
+    stats['box_kinds'] = kinds
+    return boxes, tiers, stats
 
 
-def split_tasks(task_ids: list[str], train_ratio: float, seed: int) -> tuple[set[str], set[str]]:
+def normalize_task_id(value: str) -> str:
+    """Accept ``14``, ``task_14``, or ``task-14`` → ``14``."""
+    text = str(value).strip().lower()
+    if text.startswith('task_') or text.startswith('task-'):
+        text = text[5:]
+    return text
+
+
+def split_tasks(
+    task_ids: list[str],
+    train_ratio: float,
+    seed: int,
+    val_tasks: list[str] | None = None,
+) -> tuple[set[str], set[str]]:
     ids = sorted(task_ids, key=lambda value: int(value))
+    available = set(ids)
+    if val_tasks:
+        holdout = {normalize_task_id(t) for t in val_tasks}
+        missing = sorted(holdout - available, key=lambda v: int(v) if v.isdigit() else v)
+        if missing:
+            raise ValueError(
+                f'val_tasks not present in cleaned detector export: {missing}. '
+                f'Available: {sorted(available, key=int)}'
+            )
+        if holdout == available:
+            raise ValueError('val_tasks covers every task; nothing left for train')
+        val = holdout
+        train = available - val
+        return train, val
+
     rng = random.Random(seed)
     rng.shuffle(ids)
     if len(ids) == 1:
@@ -361,13 +513,164 @@ def policy_dirname(
     always_separate: bool,
     union_iou_threshold: float | None,
     soft_band: float = 0.0,
+    pseudo_fill: bool = False,
 ) -> str:
     if always_separate or union_iou_threshold is None:
-        return 'separate'
-    name = f'union_iou{union_iou_threshold:g}'
-    if soft_band > 0:
-        name += f'_soft{soft_band:g}'
+        name = 'separate'
+    else:
+        name = f'union_iou{union_iou_threshold:g}'
+        if soft_band > 0:
+            name += f'_soft{soft_band:g}'
+    if pseudo_fill:
+        name += '_pseudofill'
     return name
+
+
+def _read_yolo_txt(path: Path) -> list[tuple[int, float, float, float, float]]:
+    rows = []
+    if not path.is_file():
+        return rows
+    for line in path.read_text(encoding='utf-8').splitlines():
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        rows.append(
+            (
+                int(float(parts[0])),
+                float(parts[1]),
+                float(parts[2]),
+                float(parts[3]),
+                float(parts[4]),
+            )
+        )
+    return rows
+
+
+def _yolo_to_xyxy(cx, cy, bw, bh, width: int, height: int):
+    x1 = (cx - bw / 2.0) * width
+    y1 = (cy - bh / 2.0) * height
+    x2 = (cx + bw / 2.0) * width
+    y2 = (cy + bh / 2.0) * height
+    return (x1, y1, x2, y2)
+
+
+def _xyxy_to_yolo_tuple(box, width: int, height: int):
+    x1, y1, x2, y2 = box
+    cx = ((x1 + x2) / 2.0) / width
+    cy = ((y1 + y2) / 2.0) / height
+    bw = (x2 - x1) / width
+    bh = (y2 - y1) / height
+    return cx, cy, bw, bh
+
+
+def pseudo_fill_unlabeled_train_labels(
+    output_root: Path,
+    *,
+    teacher_weights: str = 'yolo11m.pt',
+    conf: float = 0.25,
+    iou_match: float = 0.5,
+    device: str = 'cpu',
+    imgsz: int = 640,
+) -> dict:
+    """Add teacher person boxes to train labels when they don't overlap sparse GT.
+
+    Sparse keypoint-driven boxes leave other people unlabeled. Stock YOLO then
+    treats those people as background and punishes true detections. True ignore
+    masks are not supported in Ultralytics detect; filling train GT with teacher
+    proposals is the practical workaround. Val labels stay sparse.
+    """
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise SystemExit(
+            'ultralytics required for --pseudo-fill-unlabeled'
+        ) from exc
+    from PIL import Image
+
+    output_root = Path(output_root)
+    images_train = output_root / 'images' / 'train'
+    labels_train = output_root / 'labels' / 'train'
+    sparse_dir = output_root / 'labels' / 'train_sparse'
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    model = YOLO(teacher_weights)
+    label_paths = sorted(labels_train.glob('*.txt'))
+    added_boxes = 0
+    touched_images = 0
+    total_gt = 0
+    for label_path in label_paths:
+        stem = label_path.stem
+        image_path = images_train / f'{stem}.jpg'
+        if not image_path.is_file():
+            image_path = images_train / f'{stem}.png'
+        if not image_path.is_file():
+            continue
+
+        # Preserve original sparse labels once.
+        sparse_path = sparse_dir / label_path.name
+        if not sparse_path.is_file():
+            sparse_path.write_text(label_path.read_text(encoding='utf-8'), encoding='utf-8')
+
+        with Image.open(image_path) as im:
+            width, height = im.size
+        gt_rows = _read_yolo_txt(sparse_path if sparse_path.is_file() else label_path)
+        total_gt += len(gt_rows)
+        gt_xyxy = [
+            _yolo_to_xyxy(cx, cy, bw, bh, width, height) for _, cx, cy, bw, bh in gt_rows
+        ]
+
+        results = model.predict(
+            source=str(image_path),
+            conf=conf,
+            imgsz=imgsz,
+            device=device,
+            verbose=False,
+            classes=[0],  # COCO person
+        )
+        new_rows = list(gt_rows)
+        n_before = len(new_rows)
+        if results and results[0].boxes is not None and len(results[0].boxes):
+            boxes = results[0].boxes
+            xyxy = boxes.xyxy.cpu().tolist()
+            for box in xyxy:
+                cand = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+                if any(bbox_iou(cand, gt) >= iou_match for gt in gt_xyxy):
+                    continue
+                # Also avoid duplicates among newly added teacher boxes.
+                if any(bbox_iou(cand, _yolo_to_xyxy(*r[1:], width, height)) >= iou_match for r in new_rows[n_before:]):
+                    continue
+                cx, cy, bw, bh = _xyxy_to_yolo_tuple(cand, width, height)
+                if bw <= 0 or bh <= 0:
+                    continue
+                new_rows.append((0, cx, cy, bw, bh))
+                gt_xyxy.append(cand)
+        if len(new_rows) > n_before:
+            touched_images += 1
+            added_boxes += len(new_rows) - n_before
+        label_path.write_text(
+            ''.join(f'{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n' for cls, cx, cy, bw, bh in new_rows),
+            encoding='utf-8',
+        )
+
+    stats = {
+        'teacher_weights': teacher_weights,
+        'conf': conf,
+        'iou_match': iou_match,
+        'train_images': len(label_paths),
+        'sparse_gt_boxes': total_gt,
+        'pseudo_boxes_added': added_boxes,
+        'images_with_pseudo': touched_images,
+        'device': device,
+    }
+    meta_path = output_root / 'export_meta.json'
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        meta['pseudo_fill_unlabeled'] = stats
+        meta_path.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+    (output_root / 'pseudo_fill_stats.json').write_text(
+        json.dumps(stats, indent=2), encoding='utf-8'
+    )
+    return stats
 
 
 def write_coco(path: Path, images, annotations, categories):
@@ -394,8 +697,13 @@ def export_detection_dataset(
     min_track_length: int,
     frame_stride: int | None,
     soft_band: float = 0.0,
+    val_tasks: list[str] | None = None,
+    pseudo_fill_unlabeled: bool = False,
+    pseudo_teacher: str = 'yolo11m.pt',
+    pseudo_conf: float = 0.25,
+    pseudo_device: str = 'cpu',
 ) -> Path:
-    dataset_dir = get_pose_estimator_version_folder(annotation_version)
+    dataset_dir = get_detector_version_folder(annotation_version)
     annotation_candidates = (
         dataset_dir / 'cleaned_annotations.xml',
         dataset_dir / 'annotations.xml',
@@ -420,6 +728,7 @@ def export_detection_dataset(
         always_separate,
         None if always_separate else union_iou_threshold,
         soft_band=0.0 if always_separate else soft_band,
+        pseudo_fill=pseudo_fill_unlabeled,
     )
     if output_root is None:
         output_root = Path('dataset') / 'detection' / annotation_version / policy
@@ -428,9 +737,13 @@ def export_detection_dataset(
 
     # Split tasks first so train can use soft band and val stays hard-threshold.
     all_task_ids = sorted({task_id for task_id, _ in frames}, key=lambda v: int(v))
-    train_tasks, val_tasks = split_tasks(all_task_ids, train_ratio, seed)
+    train_tasks, val_task_ids = split_tasks(
+        all_task_ids, train_ratio, seed, val_tasks=val_tasks
+    )
 
     emitted: dict[tuple[str, int], list[tuple[float, float, float, float]]] = {}
+    emitted_tiers: dict[tuple[str, int], list[str]] = {}
+    emitted_kinds: dict[tuple[str, int], list[str]] = {}
     aggregate = defaultdict(int)
     aggregate_train = defaultdict(int)
     aggregate_val = defaultdict(int)
@@ -439,7 +752,7 @@ def export_detection_dataset(
         is_train = task_id in train_tasks
         # Train: soft random band. Val: hard τ only (clean metrics).
         soft_mode = 'random' if (is_train and soft_band > 0 and not always_separate) else 'hard'
-        boxes, stats = apply_label_policy(
+        boxes, tiers, stats = apply_label_policy(
             people,
             union_iou_threshold=None if always_separate else union_iou_threshold,
             always_separate=always_separate,
@@ -449,8 +762,12 @@ def export_detection_dataset(
         )
         if boxes:
             emitted[key] = boxes
+            emitted_tiers[key] = tiers
+            emitted_kinds[key] = list(stats.get('box_kinds') or [])
         bucket = aggregate_train if is_train else aggregate_val
         for name, value in stats.items():
+            if name == 'box_kinds':
+                continue
             aggregate[name] += value
             bucket[name] += value
 
@@ -458,7 +775,7 @@ def export_detection_dataset(
 
     splits = {
         'train': [k for k in emitted if k[0] in train_tasks],
-        'val': [k for k in emitted if k[0] in val_tasks],
+        'val': [k for k in emitted if k[0] in val_task_ids],
     }
 
     size_cache: dict[str, tuple[int, int]] = {}
@@ -474,8 +791,9 @@ def export_detection_dataset(
         'seed': seed,
         'min_track_length': min_track_length,
         'frame_stride': frame_stride,
+        'split_mode': 'clip_holdout' if val_tasks else 'random_task',
         'train_tasks': sorted(train_tasks, key=int),
-        'val_tasks': sorted(val_tasks, key=int),
+        'val_tasks': sorted(val_task_ids, key=int),
         'task_names': {tid: task_names.get(tid, '') for tid in tasks_with_frames},
         'collect_stats': collect_stats,
         'label_stats': dict(aggregate),
@@ -512,23 +830,26 @@ def export_detection_dataset(
             dest_image.symlink_to(src.resolve())
 
             boxes = emitted[(task_id, relative_frame)]
+            tiers = emitted_tiers.get((task_id, relative_frame), [TIER_MAIN] * len(boxes))
             label_path = labels_out / f'{image_name.rsplit(".", 1)[0]}.txt'
             yolo_lines = []
-            for box in boxes:
+            for box, tier in zip(boxes, tiers):
+                cls_id = TIER_TO_CLASS.get(tier, 0)
                 coco_annotations.append(
                     {
                         'id': ann_id,
                         'image_id': image_id,
-                        'category_id': PERSON_CATEGORY_ID,
+                        'category_id': PERSON_CATEGORY_ID if cls_id == 0 else 2,
                         'bbox': xyxy_to_coco_bbox(box),
                         'area': max(0.0, (box[2] - box[0]) * (box[3] - box[1])),
-                        'iscrowd': 0,
+                        'iscrowd': 0 if cls_id == 0 else 1,
                         'segmentation': [],
+                        'tier': tier,
                     }
                 )
                 ann_id += 1
                 cx, cy, bw, bh = xyxy_to_yolo(box, width, height)
-                yolo_lines.append(f'0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}')
+                yolo_lines.append(f'{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}')
             label_path.write_text('\n'.join(yolo_lines) + ('\n' if yolo_lines else ''), encoding='utf-8')
 
             coco_images.append(
@@ -547,30 +868,69 @@ def export_detection_dataset(
             output_root / 'annotations' / f'instances_{split_name}.json',
             coco_images,
             coco_annotations,
-            [PERSON_CATEGORY],
+            [
+                PERSON_CATEGORY,
+                {'id': 2, 'name': 'person_side', 'supercategory': 'person'},
+            ],
         )
         export_meta['frames'][split_name] = len(coco_images)
         export_meta[f'{split_name}_annotations'] = len(coco_annotations)
 
-    data_yaml = {
-        'path': str(output_root.resolve()),
-        'train': 'images/train',
-        'val': 'images/val',
-        'names': {0: 'person'},
+    # Per-frame / per-box kind tags for union vs separate val breakdowns.
+    box_kinds_payload = {
+        'policy': policy,
+        'union_iou_threshold': None if always_separate else union_iou_threshold,
+        'frames': {
+            f'task_{task_id}_frame_{relative_frame:06d}': {
+                'task_id': task_id,
+                'frame': relative_frame,
+                'split': ('train' if task_id in train_tasks else 'val'),
+                'kinds': emitted_kinds.get((task_id, relative_frame), []),
+                'n_union': emitted_kinds.get((task_id, relative_frame), []).count('union'),
+                'n_separate': emitted_kinds.get((task_id, relative_frame), []).count(
+                    'separate'
+                ),
+                'n_unpaired': emitted_kinds.get((task_id, relative_frame), []).count(
+                    'unpaired'
+                ),
+            }
+            for task_id, relative_frame in emitted_kinds
+        },
     }
+    (output_root / 'box_kinds.json').write_text(
+        json.dumps(box_kinds_payload, indent=2),
+        encoding='utf-8',
+    )
+    export_meta['box_kinds_file'] = 'box_kinds.json'
+
     (output_root / 'data.yaml').write_text(
-        # Minimal YAML without requiring PyYAML dump ordering tricks
-        'path: {path}\n'
-        'train: {train}\n'
-        'val: {val}\n'
+        # class 0=main person (skeleton), 1=side/background person (bbox only)
+        f'path: {output_root.resolve()}\n'
+        'train: images/train\n'
+        'val: images/val\n'
         'names:\n'
-        '  0: person\n'.format(**data_yaml),
+        '  0: person\n'
+        '  1: person_side\n',
         encoding='utf-8',
     )
     (output_root / 'export_meta.json').write_text(
         json.dumps(export_meta, indent=2),
         encoding='utf-8',
     )
+
+    if pseudo_fill_unlabeled:
+        print('Pseudo-filling unlabeled people on train labels (val left sparse)...')
+        stats = pseudo_fill_unlabeled_train_labels(
+            output_root,
+            teacher_weights=pseudo_teacher,
+            conf=pseudo_conf,
+            device=pseudo_device,
+        )
+        print(
+            f"pseudo-fill: +{stats['pseudo_boxes_added']} boxes on "
+            f"{stats['images_with_pseudo']}/{stats['train_images']} train images"
+        )
+
     return output_root
 
 
@@ -618,6 +978,15 @@ def main():
     parser.add_argument('--train-ratio', type=float, default=0.8)
     parser.add_argument('--seed', type=int, default=44)
     parser.add_argument(
+        '--val-tasks',
+        nargs='*',
+        default=None,
+        help=(
+            'Fixed clip holdout task ids (e.g. task_45 25). '
+            'When set, overrides --train-ratio random split.'
+        ),
+    )
+    parser.add_argument(
         '--min-track-length',
         type=int,
         default=10,
@@ -628,6 +997,30 @@ def main():
         type=int,
         default=None,
         help='Optional extra subsample on relative frame after cleaned filter',
+    )
+    parser.add_argument(
+        '--pseudo-fill-unlabeled',
+        action='store_true',
+        help=(
+            'Train only: add teacher person boxes that do not overlap sparse GT, '
+            'so unlabeled people are not treated as background. Val stays sparse.'
+        ),
+    )
+    parser.add_argument(
+        '--pseudo-teacher',
+        default='yolo11m.pt',
+        help='Teacher weights for --pseudo-fill-unlabeled (default: yolo11m.pt)',
+    )
+    parser.add_argument(
+        '--pseudo-conf',
+        type=float,
+        default=0.25,
+        help='Teacher conf threshold for pseudo-fill (default: 0.25)',
+    )
+    parser.add_argument(
+        '--pseudo-device',
+        default='cpu',
+        help='Device for teacher inference (default: cpu)',
     )
     args = parser.parse_args()
 
@@ -642,6 +1035,11 @@ def main():
         min_track_length=args.min_track_length,
         frame_stride=args.frame_stride,
         soft_band=args.soft_band,
+        val_tasks=args.val_tasks,
+        pseudo_fill_unlabeled=args.pseudo_fill_unlabeled,
+        pseudo_teacher=args.pseudo_teacher,
+        pseudo_conf=args.pseudo_conf,
+        pseudo_device=args.pseudo_device,
     )
     print(f'Wrote detection dataset to {output_root}')
     meta = json.loads((output_root / 'export_meta.json').read_text(encoding='utf-8'))

@@ -1,3 +1,10 @@
+"""Convert CVAT collision-suffixed images to task/frame names.
+
+Examples:
+  python -m src.dataset_review.rename_image_store --images images/default --annotations annotations.xml
+  python -m src.dataset_review.rename_image_store --images images/default --annotations annotations.xml --apply
+"""
+
 import argparse
 import re
 import xml.etree.ElementTree as ET

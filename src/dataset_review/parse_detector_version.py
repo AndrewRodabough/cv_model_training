@@ -1,9 +1,18 @@
+"""Create a cleaned detector annotation version from a CVAT project export.
+
+Main vs side people: a bbox person is ``main`` when the same task has a skeleton
+track with the same ``person_id``; otherwise ``side`` (background / no keypoints).
+"""
+
+from __future__ import annotations
+
 from argparse import ArgumentParser
 from datetime import date, datetime
 from os.path import exists
 from pathlib import Path
 from shutil import move
 import os
+import tempfile
 import xml.etree.ElementTree as ET
 
 import yaml
@@ -15,6 +24,10 @@ from src.dataset_review.dataset_parser import (
     load_project,
     shape_should_include,
     track_attribute_value,
+)
+from src.dataset_review.parse_pose_estimator_version import (
+    ingest_task_export,
+    resolve_project_annotations,
 )
 
 
@@ -35,7 +48,7 @@ def _write_manifest(path, manifest):
         )
 
 
-def _get_export_file(input_file):
+def _get_export_file(input_file: Path):
     input_path = Path(input_file).resolve()
     export_dir = EXPORT_DIR.resolve()
     try:
@@ -47,10 +60,27 @@ def _get_export_file(input_file):
             index += 1
             if index > 999:
                 raise ValueError(f'Index {index} is too large')
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         destination = EXPORT_DIR / f'{formatted_date}_{index:03d}.xml'
-        move(input_path, destination)
+        move(str(input_path), destination)
         return destination, destination.stem
     return input_path, input_path.stem
+
+
+def skeleton_person_ids_by_task(root: ET.Element) -> dict[str, set[str]]:
+    """task_id → set of person_id strings that have a skeleton track."""
+    by_task: dict[str, set[str]] = {}
+    for track in root.findall('track'):
+        if track.get('label') != 'skeleton':
+            continue
+        task_id = track.get('task_id')
+        if task_id is None:
+            continue
+        person_id = track_attribute_value(track, 'person_id')
+        if person_id is None or person_id == '':
+            continue
+        by_task.setdefault(task_id, set()).add(person_id)
+    return by_task
 
 
 def build_bbox_annotations(
@@ -58,7 +88,7 @@ def build_bbox_annotations(
     output_file: Path,
     images_dir: Path = IMAGES_DIR,
 ):
-    """Build a cleaned project annotation file containing cleaned bbox tracks."""
+    """Build cleaned detector XML; tag each person main|side via skeleton match."""
     annotations_file = Path(annotations_file)
     output_file = Path(output_file)
     images_dir = Path(images_dir)
@@ -67,6 +97,7 @@ def build_bbox_annotations(
         raise FileNotFoundError(f'Missing annotations XML: {annotations_file}')
 
     root, project, tasks = load_project(annotations_file)
+    skeleton_ids = skeleton_person_ids_by_task(root)
     task_start_frames = {}
     global_offset = 0
     for task_id in sorted(tasks, key=lambda value: int(value)):
@@ -77,6 +108,8 @@ def build_bbox_annotations(
     selected_shapes = []
     selected_tracks = set()
     selected_track_frames = 0
+    n_main = 0
+    n_side = 0
 
     for track in root.findall('track'):
         if track.get('label') != 'bbox':
@@ -87,6 +120,7 @@ def build_bbox_annotations(
 
         start_frame = task_start_frames[task_id]
         track_id = track.get('id', '')
+        track_person_id = track_attribute_value(track, 'person_id')
         for shape in track:
             if shape.tag != 'box' or shape.get('frame') is None:
                 continue
@@ -105,7 +139,7 @@ def build_bbox_annotations(
             selected_tracks.add(track_id)
             selected_track_frames += 1
             selected_images.add((task_id, relative_frame, image_name))
-            selected_shapes.append((task_id, relative_frame, track, shape))
+            selected_shapes.append((task_id, relative_frame, track, shape, track_person_id))
 
     output_root = ET.Element('dataset')
     project_element = ET.SubElement(
@@ -119,10 +153,10 @@ def build_bbox_annotations(
         (task_id, frame): image
         for task_id, frame, image in selected_images
     }
-    frames_by_task = {}
-    for task_id, frame, track, shape in selected_shapes:
+    frames_by_task: dict[str, dict[int, list]] = {}
+    for task_id, frame, track, shape, track_person_id in selected_shapes:
         frames_by_task.setdefault(task_id, {}).setdefault(frame, []).append(
-            (track, shape)
+            (track, shape, track_person_id)
         )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +167,7 @@ def build_bbox_annotations(
             id=task_id,
             name=tasks[task_id].findtext('name', ''),
         )
+        main_pids = skeleton_ids.get(task_id, set())
         for frame_number, people in sorted(frames.items()):
             frame_element = ET.SubElement(
                 video_element,
@@ -143,14 +178,21 @@ def build_bbox_annotations(
                     output_file.parent,
                 ),
             )
-            for track, shape in people:
+            for track, shape, track_person_id in people:
+                person_id = (
+                    attribute_value(shape, 'person_id')
+                    or track_person_id
+                    or ''
+                )
+                tier = 'main' if person_id in main_pids else 'side'
+                if tier == 'main':
+                    n_main += 1
+                else:
+                    n_side += 1
                 person_attrs = {
                     'track_id': track.get('id', ''),
-                    'person_id': (
-                        attribute_value(shape, 'person_id')
-                        or track_attribute_value(track, 'person_id')
-                        or ''
-                    ),
+                    'person_id': person_id,
+                    'tier': tier,
                 }
                 couple_id = (
                     attribute_value(shape, 'couple_id')
@@ -178,38 +220,93 @@ def build_bbox_annotations(
     output_tree = ET.ElementTree(output_root)
     ET.indent(output_tree, space='  ')
     output_tree.write(output_file, encoding='utf-8', xml_declaration=True)
-    return len(selected_images), len(selected_tracks), selected_track_frames
+    tasks_used = {task_id for task_id, _, _ in selected_images}
+    return {
+        'frames': len(selected_images),
+        'tracks': len(selected_tracks),
+        'track_frames': selected_track_frames,
+        'tasks': len(tasks_used),
+        'main_boxes': n_main,
+        'side_boxes': n_side,
+    }
 
 
 def main():
     parser = ArgumentParser(description='Create a cleaned detector annotation version')
-    parser.add_argument('--input-file', type=str, required=True, help='The input CVAT XML file')
+    parser.add_argument(
+        '--input-file',
+        '--annotations',
+        dest='input_file',
+        type=str,
+        required=True,
+        help='Project annotations: .xml or .zip containing annotations.xml',
+    )
+    parser.add_argument(
+        '--task',
+        dest='tasks',
+        type=Path,
+        nargs='*',
+        default=[],
+        help='Optional task export zip(s)/folders with images to ingest into image_store',
+    )
     parser.add_argument(
         '--version-type',
         choices=('major', 'minor', 'patch'),
         required=True,
     )
     parser.add_argument(
-        '--interactive',
-        action='store_true',
-        default=True,
-        help='Collect a description and change log interactively',
+        '--description',
+        type=str,
+        default='',
+        help='Manifest description (non-interactive)',
     )
     parser.add_argument(
-        '--non-interactive',
-        dest='interactive',
-        action='store_false',
-        help='Skip description and change prompts',
+        '--change',
+        dest='changes',
+        action='append',
+        default=[],
+        help='Manifest change line (repeatable)',
+    )
+    parser.add_argument(
+        '--interactive',
+        action='store_true',
+        default=False,
+        help='Collect description/changes interactively',
     )
     args = parser.parse_args()
 
-    if not exists(args.input_file):
-        raise FileNotFoundError(f'Input file {args.input_file} not found')
+    annotations_path = resolve_project_annotations(Path(args.input_file))
+    # Keep a durable copy under dataset/exports before building.
+    if annotations_path.parent != EXPORT_DIR.resolve() and not str(
+        annotations_path
+    ).startswith(str(EXPORT_DIR.resolve())):
+        # resolve_project_annotations may return a temp xml from a zip — copy contents.
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        formatted_date = datetime.now().strftime('%Y-%m-%d')
+        index = 0
+        while exists(EXPORT_DIR / f'{formatted_date}_{index:03d}.xml'):
+            index += 1
+        durable = EXPORT_DIR / f'{formatted_date}_{index:03d}.xml'
+        durable.write_bytes(Path(annotations_path).read_bytes())
+        export_version = durable.stem
+        annotations_for_build = durable
+    else:
+        annotations_for_build, export_version = _get_export_file(annotations_path)
 
-    description = ''
-    changes = []
+    ingested = 0
+    for task_path in args.tasks:
+        ingested += ingest_task_export(
+            task_path=Path(task_path),
+            image_store=IMAGES_DIR,
+            project_annotations=annotations_for_build,
+        )
+    if args.tasks:
+        print(f'Ingested {ingested} images from {len(args.tasks)} task export(s)')
+
+    description = args.description
+    changes = list(args.changes)
     if args.interactive:
-        description = input('Enter Description: ')
+        description = input('Enter Description: ') or description
         while True:
             change = input('Enter Change (enter for done): ')
             if not change:
@@ -219,9 +316,9 @@ def main():
     latest_version = get_latest_detector_version()
     major, minor, patch = parse_version(latest_version)
     if args.version_type == 'major':
-        major += 1
+        major, minor, patch = major + 1, 0, 0
     elif args.version_type == 'minor':
-        minor += 1
+        minor, patch = minor + 1, 0
     else:
         patch += 1
 
@@ -229,30 +326,42 @@ def main():
     version_folder = DETECTOR_VERSION_DIR / f'{major}.X' / f'{major}.{minor}.X' / version
     version_folder.mkdir(parents=True, exist_ok=False)
 
-    image_count, track_count, track_frame_count = build_bbox_annotations(
-        annotations_file=Path(args.input_file),
+    stats = build_bbox_annotations(
+        annotations_file=annotations_for_build,
         output_file=version_folder / 'cleaned_annotations.xml',
         images_dir=IMAGES_DIR,
     )
-
-    destination, export_version = _get_export_file(args.input_file)
-    formatted_date = datetime.now().strftime('%Y-%m-%d')
 
     manifest = {
         'annotation_version': version,
         'image_version': 0,
         'export_version': export_version,
         'date': date.today(),
-        'description': description,
-        'changes': changes,
+        'description': description
+        or 'Detector bboxes with main/side tiers (side = no skeleton track)',
+        'changes': changes
+        or [
+            'Ingest tasks 58/59 images',
+            'Tag main vs side by skeleton person_id match',
+            'Include side/background people for recall-weighted training',
+        ],
         'statistics': {
-            'frames_used': image_count,
-            'tasks_used': len({task_id for task_id, _, _ in selected_images}),
-            'tracks': track_count,
-            'track_frames': track_frame_count,
+            'frames_used': stats['frames'],
+            'tasks_used': stats['tasks'],
+            'tracks': stats['tracks'],
+            'track_frames': stats['track_frames'],
+            'main_boxes': stats['main_boxes'],
+            'side_boxes': stats['side_boxes'],
+            'images_ingested': ingested,
         },
     }
     _write_manifest(version_folder / 'manifest.yaml', manifest)
+    print(f'Wrote detector version {version} → {version_folder}')
+    print(
+        f"frames={stats['frames']} tracks={stats['tracks']} "
+        f"main={stats['main_boxes']} side={stats['side_boxes']} "
+        f"tasks={stats['tasks']}"
+    )
 
 
 if __name__ == '__main__':
