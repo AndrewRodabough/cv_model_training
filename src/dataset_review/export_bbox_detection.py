@@ -566,7 +566,7 @@ def _xyxy_to_yolo_tuple(box, width: int, height: int):
 def pseudo_fill_unlabeled_train_labels(
     output_root: Path,
     *,
-    teacher_weights: str = 'yolo11m.pt',
+    teacher_weights: str = 'weights/detector/yolo11m.pt',
     conf: float = 0.25,
     iou_match: float = 0.5,
     device: str = 'cpu',
@@ -699,7 +699,7 @@ def export_detection_dataset(
     soft_band: float = 0.0,
     val_tasks: list[str] | None = None,
     pseudo_fill_unlabeled: bool = False,
-    pseudo_teacher: str = 'yolo11m.pt',
+    pseudo_teacher: str = 'weights/detector/yolo11m.pt',
     pseudo_conf: float = 0.25,
     pseudo_device: str = 'cpu',
 ) -> Path:
@@ -1008,8 +1008,8 @@ def main():
     )
     parser.add_argument(
         '--pseudo-teacher',
-        default='yolo11m.pt',
-        help='Teacher weights for --pseudo-fill-unlabeled (default: yolo11m.pt)',
+        default='weights/detector/yolo11m.pt',
+        help='Teacher weights for --pseudo-fill-unlabeled (default: weights/detector/yolo11m.pt)',
     )
     parser.add_argument(
         '--pseudo-conf',

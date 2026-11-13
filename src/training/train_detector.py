@@ -41,7 +41,7 @@ def maybe_export(cfg: dict, images: Path | None) -> Path:
         soft_band=float(dataset_cfg.get('soft_band', 0.0)),
         val_tasks=dataset_cfg.get('val_tasks') or dataset_cfg.get('test_clips'),
         pseudo_fill_unlabeled=bool(dataset_cfg.get('pseudo_fill_unlabeled', False)),
-        pseudo_teacher=str(dataset_cfg.get('pseudo_teacher', 'yolo11m.pt')),
+        pseudo_teacher=str(dataset_cfg.get('pseudo_teacher', 'weights/detector/yolo11m.pt')),
         pseudo_conf=float(dataset_cfg.get('pseudo_conf', 0.25)),
         pseudo_device=str(dataset_cfg.get('pseudo_device', 'cpu')),
     )
@@ -166,7 +166,7 @@ def main():
                 pseudo_fill_unlabeled=bool(
                     cfg['dataset'].get('pseudo_fill_unlabeled', False)
                 ),
-                pseudo_teacher=str(cfg['dataset'].get('pseudo_teacher', 'yolo11m.pt')),
+                pseudo_teacher=str(cfg['dataset'].get('pseudo_teacher', 'weights/detector/yolo11m.pt')),
                 pseudo_conf=float(cfg['dataset'].get('pseudo_conf', 0.25)),
                 pseudo_device=str(cfg['dataset'].get('pseudo_device', 'cpu')),
             )

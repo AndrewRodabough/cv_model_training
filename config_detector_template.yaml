@@ -8,7 +8,7 @@ dataset:
   min_track_length: 10
 
 model:
-  name: yolo11m.pt
+  name: weights/detector/yolo11m.pt
   imgsz: 640
 
 training:
